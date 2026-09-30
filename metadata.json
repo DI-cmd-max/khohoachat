@@ -1,0 +1,6 @@
+{
+  "name": "Quản lý Hóa chất Vật tư Xét nghiệm",
+  "description": "Hệ thống quản lý cơ sở dữ liệu chuyên sâu cho phòng xét nghiệm (Sinh hóa, Huyết học, Miễn dịch) theo chuẩn ISO 15189.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

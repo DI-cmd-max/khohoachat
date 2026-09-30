@@ -1,0 +1,121 @@
+{
+  "collections": {
+    "users": {
+      "description": "Accounts for lab staff and technicians",
+      "fields": {
+        "username": { "type": "string", "required": true },
+        "fullName": { "type": "string", "required": true },
+        "role": { "type": "string", "required": true },
+        "password": { "type": "string", "required": true }
+      },
+      "allowRead": "true",
+      "allowWrite": "true"
+    },
+    "reagents": {
+      "description": "Medical lab reagents catalog and current stock level",
+      "fields": {
+        "id": { "type": "string", "required": true },
+        "name": { "type": "string", "required": true },
+        "category": { "type": "string", "required": true },
+        "lotNumber": { "type": "string", "required": true },
+        "packSize": { "type": "string", "required": true },
+        "currentStock": { "type": "number", "required": true },
+        "originalExpiryDate": { "type": "string", "required": true },
+        "inUseStabilityDays": { "type": "number", "required": true }
+      },
+      "allowRead": "true",
+      "allowWrite": "true"
+    },
+    "transactions": {
+      "description": "Stock import/export transaction ledger logs",
+      "fields": {
+        "id": { "type": "string", "required": true },
+        "timestamp": { "type": "string", "required": true },
+        "reagentId": { "type": "string", "required": true },
+        "reagentName": { "type": "string", "required": true },
+        "category": { "type": "string", "required": true },
+        "type": { "type": "string", "required": true },
+        "quantity": { "type": "number", "required": true },
+        "actor": { "type": "string", "required": true },
+        "notes": { "type": "string", "required": false }
+      },
+      "allowRead": "true",
+      "allowWrite": "true"
+    },
+    "reconstitutions": {
+      "description": "Reconstitution Logs for Calibration and Quality Control vials",
+      "fields": {
+        "id": { "type": "string", "required": true },
+        "timestamp": { "type": "string", "required": true },
+        "reagentName": { "type": "string", "required": true },
+        "category": { "type": "string", "required": true },
+        "lotNumber": { "type": "string", "required": true },
+        "volume": { "type": "string", "required": true },
+        "solvent": { "type": "string", "required": true },
+        "stabilityHours": { "type": "number", "required": true },
+        "expiryTimestamp": { "type": "string", "required": true },
+        "notes": { "type": "string", "required": false },
+        "status": { "type": "string", "required": true },
+        "aliquotsCount": { "type": "number", "required": false },
+        "aliquotVolume": { "type": "string", "required": false },
+        "remainingAliquots": { "type": "number", "required": false }
+      },
+      "allowRead": "true",
+      "allowWrite": "true"
+    },
+    "barcodeCategories": {
+      "description": "Customizable list of barcode category abbreviations for Calib/QC (e.g. QCSH2)",
+      "fields": {
+        "id": { "type": "string", "required": true },
+        "code": { "type": "string", "required": true },
+        "name": { "type": "string", "required": true },
+        "category": { "type": "string", "required": true },
+        "description": { "type": "string", "required": false },
+        "createdAt": { "type": "string", "required": true }
+      },
+      "allowRead": "true",
+      "allowWrite": "true"
+    },
+    "inUseStability": {
+      "description": "Opened vials currently mounted on machinery tracking in-use stability",
+      "fields": {
+        "id": { "type": "string", "required": true },
+        "reagentId": { "type": "string", "required": true },
+        "reagentName": { "type": "string", "required": true },
+        "category": { "type": "string", "required": true },
+        "lotNumber": { "type": "string", "required": true },
+        "openedDate": { "type": "string", "required": true },
+        "openedBy": { "type": "string", "required": true },
+        "inUseStabilityDays": { "type": "number", "required": true },
+        "originalExpiryDate": { "type": "string", "required": true },
+        "calculatedExpiry": { "type": "string", "required": true },
+        "positionInMachine": { "type": "string", "required": true },
+        "remainingTests": { "type": "number", "required": true },
+        "totalTests": { "type": "number", "required": true },
+        "status": { "type": "string", "required": true }
+      },
+      "allowRead": "true",
+      "allowWrite": "true"
+    },
+    "systemState": {
+      "description": "Shared simulated time and configuration",
+      "fields": {
+        "simulatedTime": { "type": "string", "required": true }
+      },
+      "allowRead": "true",
+      "allowWrite": "true"
+    },
+    "settings": {
+      "description": "Hospital Logo and document standard headers configuration",
+      "fields": {
+        "hospitalLogo": { "type": "string", "required": false },
+        "headerRow1": { "type": "string", "required": true },
+        "headerRow2": { "type": "string", "required": true },
+        "headerRow3": { "type": "string", "required": true },
+        "headerRow4": { "type": "string", "required": true }
+      },
+      "allowRead": "true",
+      "allowWrite": "true"
+    }
+  }
+}
