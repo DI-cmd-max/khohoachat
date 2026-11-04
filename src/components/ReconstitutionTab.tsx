@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { usePagination } from '../hooks/usePagination';
 import { 
   Plus, 
@@ -25,37 +26,212 @@ import {
   Settings,
   Search,
   Copy,
+  Code,
   X
 } from 'lucide-react';
 import { ReconstitutionLog, LabCategory, User as AppUser, ReagentMaterial, BarcodeCategory, SystemSettings } from '../types';
 import { formatDateTimeVN, formatDateVN, exportToExcel, exportToPDF } from '../utils';
 import JsBarcode from 'jsbarcode';
 
-// Pure SVG generator for 100% offline, standalone barcode rendering fitted for 2x5cm (50x20mm)
-function generatePureBarcodeSvg(value: string, heightMm = 7.5, isVertical = false): string {
+// Remove Vietnamese accents and sanitize special control chars for TSPL / ZPL thermal printers (CP437 / ASCII)
+function removeAccents(str: string): string {
+  return (str || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'D')
+    .replace(/"/g, "'")
+    .replace(/[\^~]/g, '-')
+    .replace(/[^\x20-\x7E]/g, '')
+    .trim();
+}
+
+// Generate raw printer machine code (TSPL / ZPL) for 50x20mm single roll (1-row) or 2x(50x20mm) double roll (2-row)
+// Standard 203 DPI (8 dots/mm):
+// - 1-row (50mm x 20mm, Gap 2mm): Width = 400 dots, Height = 160 dots, Safe Margin = 2mm (16 dots)
+// - 2-row (2 x 50mm x 20mm, Gap 2mm): Total Width = 102mm (816 dots), Left X = 16 dots, Right X = 424 dots
+function generatePrinterCode(
+  labels: { index: string; barcodeValue: string; displayName: string; lot: string; expiry: string; preparedBy: string; hospitalName: string }[],
+  format: 'TSPL' | 'ZPL',
+  labelRowType: '1-row' | '2-row' = '1-row'
+): string {
+  if (labelRowType === '2-row') {
+    // 2 labels side-by-side per row: each label is 50mm x 20mm with 2mm gap
+    const pairs: [typeof labels[0], (typeof labels[0]) | null][] = [];
+    for (let i = 0; i < labels.length; i += 2) {
+      pairs.push([labels[i], labels[i + 1] || null]);
+    }
+
+    if (format === 'TSPL') {
+      return pairs.map(([left, right]) => {
+        const lines: string[] = [
+          `SIZE 102 mm, 20 mm`,
+          `GAP 2 mm, 0 mm`,
+          `DIRECTION 1`,
+          `CLS`
+        ];
+
+        const addLabelCmds = (lbl: typeof labels[0], xOffset: number) => {
+          const cleanHosp = removeAccents(lbl.hospitalName || 'BVDK TP CAN THO').slice(0, 22);
+          const cleanName = removeAccents(lbl.displayName || 'MAU QC').slice(0, 24);
+          const cleanLot = removeAccents(lbl.lot ? `LOT:${lbl.lot}` : '');
+          const cleanExp = removeAccents(lbl.expiry ? `HSD:${lbl.expiry}` : '');
+          const cleanIndex = lbl.index ? `#${lbl.index}` : '';
+          const footText = [cleanLot, cleanExp].filter(Boolean).join(' ');
+
+          // Safe margin: X = xOffset (16 dots = 2mm), Y = 12 dots (1.5mm)
+          lines.push(`TEXT ${xOffset},12,"1",0,1,1,"${cleanHosp}${cleanIndex ? ' ' + cleanIndex : ''}"`);
+          lines.push(`TEXT ${xOffset},28,"2",0,1,1,"${cleanName}"`);
+          lines.push(`BARCODE ${xOffset},48,"128",40,1,0,2,2,"${lbl.barcodeValue}"`);
+          lines.push(`TEXT ${xOffset},114,"1",0,1,1,"${footText}"`);
+        };
+
+        addLabelCmds(left, 16); // Left label safe margin 2mm (16 dots)
+        if (right) {
+          addLabelCmds(right, 424); // Right label at 52mm + 1mm margin (424 dots)
+        }
+
+        lines.push(`PRINT 1,1`);
+        return lines.join('\n');
+      }).join('\n\n');
+    } else {
+      return pairs.map(([left, right]) => {
+        const lines: string[] = [
+          `^XA`,
+          `^PW816`,
+          `^LL160`
+        ];
+
+        const addZplCmds = (lbl: typeof labels[0], xOffset: number) => {
+          const cleanHosp = removeAccents(lbl.hospitalName || 'BVDK TP CAN THO').slice(0, 22);
+          const cleanName = removeAccents(lbl.displayName || 'MAU QC').slice(0, 24);
+          const cleanLot = removeAccents(lbl.lot ? `LOT:${lbl.lot}` : '');
+          const cleanExp = removeAccents(lbl.expiry ? `HSD:${lbl.expiry}` : '');
+          const cleanIndex = lbl.index ? `#${lbl.index}` : '';
+          const footText = [cleanLot, cleanExp].filter(Boolean).join(' ');
+
+          lines.push(`^FO${xOffset},12^A0N,15,15^FD${cleanHosp}${cleanIndex ? ' ' + cleanIndex : ''}^FS`);
+          lines.push(`^FO${xOffset},29^A0N,18,18^FD${cleanName}^FS`);
+          lines.push(`^FO${xOffset},50^BY2,2,38^BCN,38,Y,N,N^FD${lbl.barcodeValue}^FS`);
+          lines.push(`^FO${xOffset},114^A0N,15,15^FD${footText}^FS`);
+        };
+
+        addZplCmds(left, 16);
+        if (right) {
+          addZplCmds(right, 424);
+        }
+
+        lines.push(`^XZ`);
+        return lines.join('\n');
+      }).join('\n');
+    }
+  }
+
+  // 1-ROW: Single Label Roll 50mm x 20mm, Gap 2mm (203 DPI: 400 x 160 dots, Safe Margin: 1.5mm - 2mm = 12 - 16 dots)
+  if (format === 'TSPL') {
+    return labels.map((lbl) => {
+      const cleanHosp = removeAccents(lbl.hospitalName || 'BVDK TP CAN THO').slice(0, 22);
+      const cleanName = removeAccents(lbl.displayName || 'MAU QC').slice(0, 24);
+      const cleanLot = removeAccents(lbl.lot ? `LOT:${lbl.lot}` : '');
+      const cleanExp = removeAccents(lbl.expiry ? `HSD:${lbl.expiry}` : '');
+      const cleanIndex = lbl.index ? `#${lbl.index}` : '';
+      const footText = [cleanLot, cleanExp].filter(Boolean).join(' ');
+
+      return [
+        `SIZE 50 mm, 20 mm`,
+        `GAP 2 mm, 0 mm`,
+        `DIRECTION 1`,
+        `CLS`,
+        `TEXT 16,12,"1",0,1,1,"${cleanHosp}${cleanIndex ? ' ' + cleanIndex : ''}"`,
+        `TEXT 16,28,"2",0,1,1,"${cleanName}"`,
+        `BARCODE 16,48,"128",40,1,0,2,2,"${lbl.barcodeValue}"`,
+        `TEXT 16,114,"1",0,1,1,"${footText}"`,
+        `PRINT 1,1`
+      ].join('\n');
+    }).join('\n\n');
+  } else {
+    // ZPL format for Zebra barcode printers (50mm x 20mm label roll, 203 DPI: width = 400 dots, height = 160 dots)
+    return labels.map((lbl) => {
+      const cleanHosp = removeAccents(lbl.hospitalName || 'BVDK TP CAN THO').slice(0, 22);
+      const cleanName = removeAccents(lbl.displayName || 'MAU QC').slice(0, 24);
+      const cleanLot = removeAccents(lbl.lot ? `LOT:${lbl.lot}` : '');
+      const cleanExp = removeAccents(lbl.expiry ? `HSD:${lbl.expiry}` : '');
+      const cleanIndex = lbl.index ? `#${lbl.index}` : '';
+      const footText = [cleanLot, cleanExp].filter(Boolean).join(' ');
+
+      return [
+        `^XA`,
+        `^PW400`,
+        `^LL160`,
+        `^FO16,12^A0N,15,15^FD${cleanHosp}${cleanIndex ? ' ' + cleanIndex : ''}^FS`,
+        `^FO16,29^A0N,18,18^FD${cleanName}^FS`,
+        `^FO16,50^BY2,2,38^BCN,38,Y,N,N^FD${lbl.barcodeValue}^FS`,
+        `^FO16,114^A0N,15,15^FD${footText}^FS`,
+        `^XZ`
+      ].join('\n');
+    }).join('\n');
+  }
+}
+
+// Pure 1:1 Vector SVG generator for crisp thermal printing on 50mm x 20mm labels (Safe zone: 46mm x 17mm)
+// Converts bars to <path d="..."> and sets explicit mm width/height so browser print engines never collapse SVG width or rect bars
+function generatePureBarcodeSvg(value: string, heightMm = 7.0, maxWidthMm = 44): string {
   try {
     const cleanVal = (value || 'QC').trim();
     const svgNode = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    // Code 128 module count: ~11 modules per character + 35 start/stop/check modules
-    const numModules = cleanVal.length * 11 + 35;
-    // In vertical mode on a 50x20mm label, barcode length fits in ~15.5mm
-    const targetWidthMm = isVertical 
-      ? 15.5 
-      : Math.max(30, Math.min(43, Math.round(numModules * 0.19 * 10) / 10));
 
     JsBarcode(svgNode, cleanVal, {
       format: 'CODE128',
-      width: isVertical ? 1 : 2,
-      height: isVertical ? 25 : 40,
+      width: 2, // Integer module width for 1:1 bar ratio
+      height: 40,
       displayValue: false,
-      margin: 0,
+      margin: 0, // Quiet zone is guaranteed by the 2mm label padding
       background: 'transparent',
       lineColor: '#000000',
     });
 
-    // Make SVG vector scalable with exact 2x5cm fitting
+    const vbAttr = svgNode.getAttribute('viewBox') || '';
+    const vbParts = vbAttr.trim().split(/\s+/).map(Number);
+    const widthAttr = parseFloat(svgNode.getAttribute('width') || '160') || 160;
+    const heightAttr = parseFloat(svgNode.getAttribute('height') || '40') || 40;
+    const vbWidth = vbParts.length === 4 && vbParts[2] > 0 ? vbParts[2] : widthAttr;
+    const vbHeight = vbParts.length === 4 && vbParts[3] > 0 ? vbParts[3] : heightAttr;
+
+    // Convert all <rect> bars into a single <path> so CSS rules on rect/children can never collapse bar widths
+    const rects = Array.from(svgNode.querySelectorAll('rect'));
+    const pathSegments: string[] = [];
+    rects.forEach((r) => {
+      const styleAttr = r.getAttribute('style') || '';
+      const fillAttr = r.getAttribute('fill') || '';
+      if (styleAttr.includes('transparent') || fillAttr === 'transparent' || fillAttr === 'none') {
+        return;
+      }
+      const x = parseFloat(r.getAttribute('x') || '0');
+      const y = parseFloat(r.getAttribute('y') || '0');
+      const w = parseFloat(r.getAttribute('width') || '0');
+      const h = parseFloat(r.getAttribute('height') || String(vbHeight));
+      if (w > 0 && h > 0) {
+        pathSegments.push(`M${x},${y}h${w}v${h}h-${w}Z`);
+      }
+    });
+
+    const naturalWidthMm = Number(((vbWidth / vbHeight) * heightMm).toFixed(2));
+    const finalWidthMm = Math.min(maxWidthMm, Math.max(22, naturalWidthMm));
+
+    if (pathSegments.length > 0) {
+      return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${vbWidth} ${vbHeight}" width="${finalWidthMm}mm" height="${heightMm}mm" preserveAspectRatio="none" shape-rendering="crispEdges" style="display:block;margin:0 auto;width:${finalWidthMm}mm;max-width:${maxWidthMm}mm;height:${heightMm}mm;shape-rendering:crispEdges;overflow:visible;"><path d="${pathSegments.join('')}" fill="#000000" shape-rendering="crispEdges"/></svg>`;
+    }
+
+    svgNode.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+    svgNode.setAttribute('viewBox', `0 0 ${vbWidth} ${vbHeight}`);
+    svgNode.setAttribute('width', `${finalWidthMm}mm`);
+    svgNode.setAttribute('height', `${heightMm}mm`);
     svgNode.setAttribute('preserveAspectRatio', 'none');
-    svgNode.setAttribute('style', `display:block;margin:0 auto;width:${targetWidthMm}mm;max-width:${isVertical ? '16mm' : '44mm'};height:${heightMm}mm;`);
+    svgNode.setAttribute('shape-rendering', 'crispEdges');
+    svgNode.setAttribute(
+      'style',
+      `display:block;margin:0 auto;width:${finalWidthMm}mm;max-width:${maxWidthMm}mm;height:${heightMm}mm;shape-rendering:crispEdges;`
+    );
     return svgNode.outerHTML;
   } catch (err) {
     console.error('generatePureBarcodeSvg error:', err);
@@ -143,24 +319,23 @@ export default function ReconstitutionTab({
     description: '',
   });
 
-  // Print Label Modal State - Dedicated to TSC TL 240
+  // Print Label Modal State
   const [isPrintModalOpen, setIsPrintModalOpen] = useState(false);
+  const [isPrePrintOverlayOpen, setIsPrePrintOverlayOpen] = useState(false);
   const [selectedReconForPrint, setSelectedReconForPrint] = useState<ReconstitutionLog | null>(null);
   const [selectedBarcodeCategory, setSelectedBarcodeCategory] = useState<BarcodeCategory | null>(null);
-  const [isTSCGuideOpen, setIsTSCGuideOpen] = useState(false);
-  const [isBarTenderGuideOpen, setIsBarTenderGuideOpen] = useState(false);
+  const [printModalTab, setPrintModalTab] = useState<'label' | 'code'>('label');
+  const [printerCodeFormat, setPrinterCodeFormat] = useState<'TSPL' | 'ZPL'>('TSPL');
+  const [copiedCode, setCopiedCode] = useState(false);
   
-  // Custom print config for TSC TL 240 (50mm x 20mm)
+  // Custom print config for 50x20mm (1-row) or 2x(50x20mm) (2-row)
   const [printConfig, setPrintConfig] = useState({
     hospitalName: 'BVĐK TP Cần Thơ - Khoa XN',
     includeHospital: true,
-    includeLot: false,
-    includeIndex: false,
+    includeLot: true,
+    includeIndex: true,
     customCount: 0, // 0 means use remainingAliquots, > 0 means custom count
-    labelSize: '50x20' as '50x20' | '50x20_double',
-    orientation: 'landscape' as 'landscape' | 'portrait',
-    barcodeOrientation: 'horizontal' as 'horizontal' | 'vertical' | 'rotate180' | 'vertical270',
-    barcodeHeight: 7.5, // 7.5mm standard, fits 2x5cm perfectly
+    labelRowType: '1-row' as '1-row' | '2-row', // '1-row' = 1 hàng tem (50x20mm), '2-row' = 2 hàng tem đôi (102x20mm)
   });
 
   // React to targetHighlight
@@ -772,503 +947,345 @@ export default function ReconstitutionTab({
     return labels;
   };
 
-  // 1. Export BarTender CSV format (UTF-8 with BOM for Vietnamese characters)
-  const handleExportBarTenderCSV = () => {
+  // Group labels into pairs of 2 for 2-row (2-across) label rolls
+  const getPairedLabelRows = () => {
     const labels = getPreparedLabels();
-    if (labels.length === 0) return;
-
-    const headers = [
-      'Barcode',
-      'TenChatChuanQC',
-      'SoLo',
-      'HanSuDung',
-      'SoThuTuTuyp',
-      'NguoiHoanNguyen',
-      'DonVi'
-    ];
-
-    const escapeCsv = (str: string) => {
-      if (!str) return '""';
-      const escaped = String(str).replace(/"/g, '""');
-      return `"${escaped}"`;
-    };
-
-    const csvRows = [
-      headers.join(','),
-      ...labels.map(l => [
-        escapeCsv(l.barcodeValue),
-        escapeCsv(l.displayName),
-        escapeCsv(l.lot),
-        escapeCsv(l.expiry),
-        escapeCsv(l.index),
-        escapeCsv(l.preparedBy),
-        escapeCsv(l.hospitalName)
-      ].join(','))
-    ];
-
-    const csvContent = '\uFEFF' + csvRows.join('\r\n');
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    const cleanName = (labels[0]?.displayName || 'BarTender').replace(/[^a-zA-Z0-9_\u00C0-\u024F\u1EA0-\u1EF9]/g, '_');
-    link.href = url;
-    link.setAttribute('download', `BarTender_Data_${cleanName}_${new Date().toISOString().slice(0, 10)}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+    const rows: [typeof labels[0], (typeof labels[0]) | null][] = [];
+    for (let i = 0; i < labels.length; i += 2) {
+      rows.push([labels[i], labels[i + 1] || null]);
+    }
+    return rows;
   };
 
-  // 2. Export BarTender XML Script (.btxml) for BarTender Enterprise Automation / Integration Builder
-  const handleExportBarTenderXML = () => {
+  // Handlers for Printer Code (TSPL / ZPL) with reliable fallback copy for BarTender / Zebra Setup Utilities
+  const handleCopyPrinterCode = () => {
     const labels = getPreparedLabels();
     if (labels.length === 0) return;
+    const code = generatePrinterCode(labels, printerCodeFormat, printConfig.labelRowType);
 
-    const escapeXml = (unsafe: string) => {
-      return (unsafe || '').replace(/[<>&'"]/g, (c) => {
-        switch (c) {
-          case '<': return '&lt;';
-          case '>': return '&gt;';
-          case '&': return '&amp;';
-          case '\'': return '&apos;';
-          case '"': return '&quot;';
-          default: return c;
+    const markCopied = () => {
+      setCopiedCode(true);
+      setTimeout(() => setCopiedCode(false), 2500);
+    };
+
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(code).then(markCopied).catch(() => {
+        const textArea = document.createElement('textarea');
+        textArea.value = code;
+        textArea.style.position = 'fixed';
+        textArea.style.opacity = '0';
+        document.body.appendChild(textArea);
+        textArea.focus();
+        textArea.select();
+        try {
+          document.execCommand('copy');
+          markCopied();
+        } catch (err) {
+          console.error('Fallback copy failed:', err);
         }
+        document.body.removeChild(textArea);
       });
-    };
-
-    const cleanName = (labels[0]?.displayName || 'BarTender').replace(/[^a-zA-Z0-9_\u00C0-\u024F\u1EA0-\u1EF9]/g, '_');
-    const targetPrinterName = 'TSC TL 240';
-    const xmlContent = `<?xml version="1.0" encoding="utf-8"?>
-<XMLScript Version="2.0">
-  <Command Name="PrintJob_HoanNguyen_${Date.now()}">
-    <Print>
-      <Format>C:\\BarTender_Templates\\Tem_Hoan_Nguyen_50x20.btw</Format>
-      <PrintSetup>
-        <Printer>${targetPrinterName}</Printer>
-        <IdenticalCopiesOfLabel>1</IdenticalCopiesOfLabel>
-      </PrintSetup>
-      <RecordSet Name="Labels">
-${labels.map(l => `        <Record>
-          <Field Name="Barcode">${escapeXml(l.barcodeValue)}</Field>
-          <Field Name="TenChatChuanQC">${escapeXml(l.displayName)}</Field>
-          <Field Name="SoLo">${escapeXml(l.lot)}</Field>
-          <Field Name="HanSuDung">${escapeXml(l.expiry)}</Field>
-          <Field Name="SoThuTuTuyp">${escapeXml(l.index)}</Field>
-          <Field Name="NguoiHoanNguyen">${escapeXml(l.preparedBy)}</Field>
-          <Field Name="DonVi">${escapeXml(l.hospitalName)}</Field>
-        </Record>`).join('\n')}
-      </RecordSet>
-    </Print>
-  </Command>
-</XMLScript>`;
-
-    const blob = new Blob([xmlContent], { type: 'application/xml;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.setAttribute('download', `BarTender_Automation_${cleanName}_${new Date().toISOString().slice(0, 10)}.btxml`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+    } else {
+      const textArea = document.createElement('textarea');
+      textArea.value = code;
+      textArea.style.position = 'fixed';
+      textArea.style.opacity = '0';
+      document.body.appendChild(textArea);
+      textArea.focus();
+      textArea.select();
+      try {
+        document.execCommand('copy');
+        markCopied();
+      } catch (err) {
+        console.error('Fallback copy failed:', err);
+      }
+      document.body.removeChild(textArea);
+    }
   };
 
-  // 3. Export native TSC TSPL/TSPL2 code (.tspl / .prn) for TSC TL 240 / TE240 calibrated for 2x5cm
-  const handleExportTSPL = () => {
+  const handleDownloadPrinterCode = () => {
     const labels = getPreparedLabels();
     if (labels.length === 0) return;
-
-    const removeAccents = (str: string) => {
-      return (str || '')
-        .normalize('NFD')
-        .replace(/[\u0300-\u036f]/g, '')
-        .replace(/đ/g, 'd')
-        .replace(/Đ/g, 'D');
-    };
-
-    const rotationDeg = printConfig.barcodeOrientation === 'vertical' ? 90 : printConfig.barcodeOrientation === 'vertical270' ? 270 : printConfig.barcodeOrientation === 'rotate180' ? 180 : 0;
-
-    const tsplBlocks = labels.map(l => {
-      const cleanName = removeAccents(l.displayName).substring(0, 24);
-      const cleanHosp = l.hospitalName ? removeAccents(l.hospitalName).substring(0, 28) : '';
-      const val = l.barcodeValue;
-      // Calculate Code 128 width in dots at 203 DPI (8 dots/mm, 50mm = 400 dots, 20mm = 160 dots)
-      const numModules = val.length * 11 + 35;
-      // If 2 dots/module exceeds 340 dots (leaving 30 dots = 3.75mm quiet margin on each side), use narrow=1
-      const narrow = (numModules * 2 > 340) ? 1 : 2;
-      const barcodeWidthDots = numModules * narrow;
-      const startX = Math.max(16, Math.floor((400 - barcodeWidthDots) / 2));
-      const bcHeight = cleanHosp ? 42 : 50; // dots
-      const bcY = cleanHosp ? 50 : 32;
-      const textY = bcY + bcHeight + 4;
-      const footerY = textY + 22;
-
-      return `SIZE 50 mm, 20 mm
-GAP 2 mm, 0 mm
-DIRECTION 1,0
-REFERENCE 0,0
-OFFSET 0 mm
-SET PEEL OFF
-SET CUTTER OFF
-SET PARTIAL_CUTTER OFF
-CLS
-${cleanHosp ? `TEXT 200,8,"0",0,1,1,2,"${cleanHosp}"\nBARLINE 15,24,370,1\nTEXT 200,28,"0",0,1,1,2,"${cleanName}"` : `TEXT 200,10,"0",0,1,1,2,"${cleanName}"`}
-BARCODE ${startX},${bcY},"128",${bcHeight},0,${rotationDeg},${narrow},${narrow * 2},"${val}"
-TEXT 200,${textY},"0",0,1,1,2,"${val}"
-BARLINE 15,${footerY - 3},370,1
-TEXT 20,${footerY},"0",0,1,1,0,"LOT: ${l.lot || '---'}"
-TEXT 200,${footerY},"0",0,1,1,0,"HSD: ${l.expiry}"
-${l.index ? `TEXT 340,${footerY},"0",0,1,1,0,"#${l.index}"` : ''}
-PRINT 1,1`;
-    }).join('\n\n');
-
-    const cleanName = (labels[0]?.displayName || 'TSC_TL240').replace(/[^a-zA-Z0-9_\u00C0-\u024F\u1EA0-\u1EF9]/g, '_');
-    const blob = new Blob([tsplBlocks], { type: 'text/plain;charset=utf-8;' });
+    const code = generatePrinterCode(labels, printerCodeFormat, printConfig.labelRowType);
+    const itemName = (selectedBarcodeCategory?.code || selectedReconForPrint?.targetItemName || 'Tem_2x10').replace(/[^a-zA-Z0-9_\u00C0-\u024F\u1EA0-\u1EF9]/g, '_');
+    const ext = printerCodeFormat.toLowerCase();
+    const blob = new Blob([code], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.setAttribute('download', `TSC_TL240_${cleanName}_${new Date().toISOString().slice(0, 10)}.tspl`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `Ma_In_${printerCodeFormat}_${printConfig.labelRowType}_${itemName}.${ext}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
     URL.revokeObjectURL(url);
   };
 
-  // 3. Print action specifically calibrated for TSC TL 240 (50mm x 20mm)
-  const getPrintLabelHtml = () => {
+  // Thermal Label Roll Print HTML:
+  // - 1-row: 50mm x 20mm single label roll (@page { size: 50mm 20mm; margin: 0; }, Safe Margin: 1.5mm top/bottom, 2mm left/right)
+  // - 2-row: 102mm x 20mm double label roll (2 x 50mm x 20mm with 2mm gap)
+  const getPrintLabelHtml = (includeInteractiveToolbar = false) => {
     if (!selectedReconForPrint && !selectedBarcodeCategory) return null;
 
     const labels = getPreparedLabels();
     if (labels.length === 0) return null;
 
-    const labelRows = [];
-    const isDoubleRow = printConfig.labelSize === '50x20_double';
-    const itemsPerRow = isDoubleRow ? 2 : 1;
-    for (let i = 0; i < labels.length; i += itemsPerRow) {
-      if (itemsPerRow === 1) {
-        labelRows.push([labels[i]]);
-      } else {
-        labelRows.push([labels[i], labels[i + 1]]);
+    const isTwoRow = printConfig.labelRowType === '2-row';
+    const pageWidthMm = isTwoRow ? '102mm' : '50mm';
+
+    const renderSingleSticker = (item: typeof labels[0] | null, extraClass = '') => {
+      if (!item) {
+        return `<div class="label-sticker-50x20 ${extraClass}"></div>`;
       }
-    }
-
-    const isVertical = printConfig.barcodeOrientation === 'vertical' || printConfig.barcodeOrientation === 'vertical270';
-    const isRot180 = printConfig.barcodeOrientation === 'rotate180';
-    const rotDeg = printConfig.barcodeOrientation === 'vertical270' ? -90 : 90;
-
-    const renderSingleLabel = (item: typeof labels[0]) => {
-      const bcHeight = isVertical ? 6.0 : (printConfig.includeHospital ? 7.0 : (printConfig.barcodeHeight || 8.0));
-      const barcodeSvg = generatePureBarcodeSvg(item.barcodeValue, bcHeight, isVertical);
-
-      if (isVertical) {
-        return `
-          <div class="print-label print-label-vertical">
-            <div class="bc-vert-col">
-              <div class="bc-vert-wrapper" style="transform: rotate(${rotDeg}deg);">
-                ${barcodeSvg}
-                <div class="barcode-text-vert">${item.barcodeValue}</div>
-              </div>
-            </div>
-            <div class="info-vert-col">
-              ${(printConfig.includeHospital && item.hospitalName) ? `<div class="header-hosp-vert">${item.hospitalName}</div>` : ''}
-              <div class="item-name-vert">${item.displayName}</div>
-              <div class="details-vert">
-                <div>LOT: ${item.lot || '---'}</div>
-                <div>HSD: ${item.expiry || '---'}</div>
-              </div>
-              ${item.index ? `<div class="index-badge-vert">Tuýp #${item.index}</div>` : `<div style="font-size: 6.5px; color: #64748b; text-align: right;">50x20mm</div>`}
-            </div>
-          </div>
-        `;
-      }
-
+      const barcodeSvg = generatePureBarcodeSvg(item.barcodeValue, 7.0, 44);
       return `
-        <div class="print-label ${isRot180 ? 'rot-180' : ''}">
-          ${(printConfig.includeHospital && item.hospitalName) ? `<div class="header-hosp">${item.hospitalName}</div>` : ''}
-          <div class="item-name">${item.displayName}</div>
-          <div class="barcode-container">
-            ${barcodeSvg}
+        <div class="label-sticker-50x20 ${extraClass}">
+          <div class="label-header">
+            <span class="header-hosp">${item.hospitalName ? item.hospitalName : ''}</span>
+            ${item.index ? `<span class="index-badge">#${item.index}</span>` : ''}
           </div>
-          <div class="barcode-text">${item.barcodeValue}</div>
-          <div class="footer-text">
-            <span>LOT: ${item.lot || '---'}</span>
-            <span>HSD: ${item.expiry || '---'}</span>
-            ${item.index ? `<span>#${item.index}</span>` : ''}
+          <div class="item-name">${item.displayName}</div>
+          <div class="barcode-section">
+            ${barcodeSvg}
+            <div class="barcode-text">${item.barcodeValue}</div>
+          </div>
+          <div class="label-footer">
+            <span>LOT:${item.lot || '---'}</span>
+            <span>HSD:${item.expiry || '---'}</span>
           </div>
         </div>
       `;
     };
 
-    const rowsHtml = labelRows.map((row) => `
-      <div class="print-row">
-        ${row[0] ? renderSingleLabel(row[0]) : ''}
-        ${itemsPerRow === 2 && row[1] ? renderSingleLabel(row[1]) : ''}
-      </div>
-    `).join('');
+    const labelsHtml = isTwoRow
+      ? getPairedLabelRows().map(([left, right]) => `
+          <div class="label-row-2col">
+            ${renderSingleSticker(left)}
+            ${renderSingleSticker(right)}
+          </div>
+        `).join('')
+      : labels.map((item) => renderSingleSticker(item, 'single-page-break')).join('');
 
-    const pageWidth = isDoubleRow ? '104mm' : '50mm';
-    const pageHeight = '20mm';
+    const toolbarHtml = includeInteractiveToolbar
+      ? `
+      <div class="no-print" style="background:#0f172a;color:#f8fafc;padding:12px 16px;font-family:system-ui,sans-serif;border-bottom:2px solid #14b8a6;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;">
+        <div style="font-size:12px;line-height:1.5;">
+          <div style="font-weight:800;color:#5eead4;font-size:13px;">🖨️ CỬA SỔ IN TEM NHÃN NHIỆT ĐỘC LẬP (${isTwoRow ? '102 × 20 mm - 2 Hàng Tem' : '50 × 20 mm - 1 Hàng Tem'})</div>
+          <div>Kiểm tra nhanh: <b>Paper Size:</b> ${isTwoRow ? '102×20mm (hoặc 100×20mm)' : '50×20mm'} &nbsp;|&nbsp; <b>Margins:</b> None (Không lề) &nbsp;|&nbsp; <b>Scale:</b> 100% (Không Fit to Page)</div>
+        </div>
+        <div style="display:flex;gap:8px;">
+          <button onclick="window.focus();window.print();" style="background:#0d9488;color:#fff;border:none;padding:8px 16px;border-radius:8px;font-weight:800;font-size:13px;cursor:pointer;">🖨️ Bấm để In ngay</button>
+          <button onclick="window.close();" style="background:#334155;color:#e2e8f0;border:none;padding:8px 12px;border-radius:8px;font-weight:600;font-size:12px;cursor:pointer;">✕ Đóng</button>
+        </div>
+      </div>
+      <script>
+        window.onload = function() {
+          setTimeout(function() {
+            try {
+              window.focus();
+              window.print();
+            } catch (e) {
+              console.error(e);
+            }
+          }, 180);
+        };
+      </script>
+      `
+      : '';
 
     return `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>In_Tem_TSC_TL240_50x20</title>
+  <title>In_Tem_50x20mm_${isTwoRow ? '2_Hang_Tem' : '1_Hang_Tem'}</title>
   <style>
     * {
       box-sizing: border-box;
       -webkit-print-color-adjust: exact !important;
       print-color-adjust: exact !important;
+      margin: 0;
+      padding: 0;
     }
     @page {
-      size: ${pageWidth} ${pageHeight};
-      margin: 0mm !important;
+      size: ${pageWidthMm} 20mm !important;
+      margin: 0 !important;
+    }
+    @media screen {
+      body {
+        background: ${includeInteractiveToolbar ? '#1e293b' : '#ffffff'};
+      }
+      .print-labels-wrapper {
+        margin: ${includeInteractiveToolbar ? '20px auto' : '0'};
+        width: ${pageWidthMm};
+        display: flex;
+        flex-direction: column;
+        gap: ${includeInteractiveToolbar ? '8px' : '0'};
+      }
     }
     @media print {
       @page {
-        size: ${pageWidth} ${pageHeight};
-        margin: 0mm !important;
+        size: ${pageWidthMm} 20mm !important;
+        margin: 0 !important;
       }
       html, body {
-        width: ${pageWidth} !important;
-        height: ${pageHeight} !important;
+        width: ${pageWidthMm} !important;
+        height: auto !important;
         margin: 0 !important;
         padding: 0 !important;
         background: #ffffff !important;
-        overflow: hidden !important;
       }
-      .print-row {
-        page-break-inside: avoid !important;
-        break-inside: avoid !important;
+      .no-print {
+        display: none !important;
+      }
+      .print-labels-wrapper {
+        width: ${pageWidthMm} !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        display: block !important;
+      }
+      .single-page-break, .label-row-2col {
         page-break-after: always !important;
         break-after: page !important;
+        page-break-inside: avoid !important;
+        break-inside: avoid !important;
       }
-      .print-row:last-child {
+      .single-page-break:last-child, .label-row-2col:last-child {
         page-break-after: auto !important;
         break-after: auto !important;
       }
     }
     html, body {
-      margin: 0 !important;
-      padding: 0 !important;
-      background: #ffffff !important;
-      color: #000000 !important;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
-      font-weight: 800;
-      width: ${pageWidth};
-      height: ${pageHeight};
-      overflow: hidden;
-    }
-    .print-row {
-      display: flex;
-      flex-direction: row;
-      justify-content: center;
-      align-items: center;
-      width: ${pageWidth};
-      height: ${pageHeight};
-      max-height: ${pageHeight};
-      box-sizing: border-box;
-      margin: 0 auto;
+      margin: 0;
       padding: 0;
-      page-break-after: always;
-      break-after: page;
-      page-break-inside: avoid;
-      break-inside: avoid;
-      overflow: hidden;
-      background: #ffffff;
+      color: #000000;
+      font-family: Arial, Helvetica, sans-serif;
+      font-weight: 700;
+      -webkit-font-smoothing: none;
     }
-    .print-row:last-child {
-      page-break-after: auto;
-      break-after: auto;
-    }
-    .print-label {
+    .label-sticker-50x20 {
       width: 50mm;
       height: 20mm;
       max-width: 50mm;
       max-height: 20mm;
-      min-width: 50mm;
-      min-height: 20mm;
-      box-sizing: border-box;
-      padding: 0.8mm 1.5mm 0.8mm 1.5mm;
-      margin: 0 auto;
+      padding: 1.5mm 2mm;
       display: flex;
       flex-direction: column;
       justify-content: space-between;
-      align-items: center;
-      text-align: center;
       overflow: hidden;
-      border: none;
       background: #ffffff;
       color: #000000;
     }
-    .print-label.print-label-vertical {
-      flex-direction: row;
+    .single-page-break {
+      page-break-after: always;
+      break-after: page;
+    }
+    .label-row-2col {
+      width: 102mm;
+      height: 20mm;
+      display: grid;
+      grid-template-columns: 50mm 50mm;
+      column-gap: 2mm;
+      page-break-after: always;
+      break-after: page;
+      overflow: hidden;
+      background: #ffffff;
+    }
+    .label-header {
+      display: flex;
       justify-content: space-between;
-      align-items: stretch;
-      padding: 0.8mm 1.5mm;
-      text-align: left;
-    }
-    .print-label.rot-180 {
-      transform: rotate(180deg);
-    }
-    .bc-vert-col {
-      width: 18mm;
-      height: 18.2mm;
-      display: flex;
-      flex-direction: column;
-      justify-content: center;
       align-items: center;
-      overflow: hidden;
-      flex-shrink: 0;
-    }
-    .bc-vert-wrapper {
-      display: flex;
-      flex-direction: column;
-      justify-content: center;
-      align-items: center;
-      width: 16mm;
-      height: 16mm;
-      transform-origin: center center;
-    }
-    .barcode-text-vert {
-      font-size: 7.5px;
-      font-family: 'Consolas', 'Courier New', monospace;
-      font-weight: 900;
-      text-align: center;
-      margin-top: 0.5px;
-      line-height: 1;
-      color: #000000;
-      letter-spacing: 0.5px;
-      white-space: nowrap;
-    }
-    .info-vert-col {
-      flex: 1;
-      height: 18.2mm;
-      display: flex;
-      flex-direction: column;
-      justify-content: space-between;
-      padding-left: 1.5mm;
-      border-left: 0.8px dashed #000000;
-      box-sizing: border-box;
-      overflow: hidden;
-      min-width: 0;
-    }
-    .header-hosp-vert {
-      font-size: 6px;
-      font-weight: 700;
-      text-transform: uppercase;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      line-height: 1;
-      color: #000000;
-    }
-    .item-name-vert {
-      font-size: 8.5px;
-      font-weight: 900;
-      line-height: 1.15;
-      color: #000000;
-      letter-spacing: -0.1px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      display: -webkit-box;
-      -webkit-line-clamp: 2;
-      -webkit-box-orient: vertical;
-      max-height: 6.8mm;
-    }
-    .details-vert {
-      font-size: 7px;
-      font-weight: 800;
-      line-height: 1.2;
-      color: #000000;
-    }
-    .index-badge-vert {
-      font-size: 7.5px;
-      font-weight: 900;
-      color: #000000;
-      text-align: right;
       line-height: 1;
     }
     .header-hosp {
-      font-size: 6.5px;
+      font-size: 6.2px;
       font-weight: 700;
       text-transform: uppercase;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-      max-width: 47mm;
-      line-height: 1;
+      max-width: 35mm;
       color: #000000;
-      letter-spacing: 0.1px;
+    }
+    .index-badge {
+      font-size: 6.8px;
+      font-weight: 900;
+      color: #000000;
+      line-height: 1;
     }
     .item-name {
-      font-size: ${printConfig.includeHospital ? '8.5px' : '10px'};
+      font-size: 8px;
       font-weight: 900;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-      max-width: 47mm;
-      line-height: 1.15;
+      max-width: 46mm;
+      line-height: 1.05;
       color: #000000;
-      letter-spacing: -0.1px;
     }
-    .barcode-container {
+    .barcode-section {
       width: 100%;
       display: flex;
-      justify-content: center;
+      flex-direction: column;
       align-items: center;
-      overflow: hidden;
-      margin: 0.2mm auto;
-      text-align: center;
+      justify-content: center;
+      margin: 0;
     }
-    .barcode-container svg {
+    .barcode-section svg {
       display: block !important;
       margin: 0 auto !important;
+      height: 7.0mm !important;
+      max-width: 44mm !important;
+      shape-rendering: crispEdges !important;
+      overflow: visible !important;
+    }
+    .barcode-section svg path,
+    .barcode-section svg rect {
+      fill: #000000 !important;
+      shape-rendering: crispEdges !important;
     }
     .barcode-text {
-      font-size: 8.5px;
+      font-size: 6.8px;
       font-family: 'Consolas', 'Courier New', monospace;
-      font-weight: 900 !important;
-      text-align: center;
-      width: 100%;
-      letter-spacing: 0.8px;
-      color: #000000 !important;
+      font-weight: 900;
+      letter-spacing: 0.4px;
       line-height: 1;
-      margin: 0.2mm 0;
+      margin-top: 0.2mm;
+      text-align: center;
+      color: #000000;
     }
-    .footer-text {
-      font-size: 7.2px;
-      font-weight: 800 !important;
-      color: #000000 !important;
-      border-top: 0.8px solid #000000 !important;
-      padding-top: 0.4mm;
+    .label-footer {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      width: 100%;
+      font-size: 6px;
+      font-weight: 700;
+      border-top: 0.4px solid #000000;
+      padding-top: 0.3mm;
       line-height: 1;
-      box-sizing: border-box;
+      width: 100%;
+      color: #000000;
     }
   </style>
 </head>
 <body>
-  ${rowsHtml}
+  ${toolbarHtml}
+  <div class="print-labels-wrapper">
+    ${labelsHtml}
+  </div>
 </body>
 </html>`;
   };
 
   const handleDownloadPrintHtml = () => {
-    const html = getPrintLabelHtml();
+    const html = getPrintLabelHtml(true);
     if (!html) return;
     try {
       const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      const itemName = (selectedBarcodeCategory?.code || selectedReconForPrint?.targetItemName || 'Tem').replace(/[^a-zA-Z0-9_\u00C0-\u024F\u1EA0-\u1EF9]/g, '_');
-      a.download = `In_Tem_TSC_${itemName}_50x20.html`;
+      const itemName = (selectedBarcodeCategory?.code || selectedReconForPrint?.targetItemName || 'Tem_50x20').replace(/[^a-zA-Z0-9_\u00C0-\u024F\u1EA0-\u1EF9]/g, '_');
+      a.download = `In_Tem_50x20mm_${printConfig.labelRowType}_${itemName}.html`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -1278,61 +1295,69 @@ PRINT 1,1`;
     }
   };
 
-  const handlePrintAction = () => {
-    const html = getPrintLabelHtml();
+  // Open standalone unsandboxed print window (escapes iframe sandbox restrictions)
+  const handleOpenPrintWindow = (): boolean => {
+    const htmlWithToolbar = getPrintLabelHtml(true);
+    if (!htmlWithToolbar) return false;
+    try {
+      const printWin = window.open('', '_blank', 'width=860,height=640');
+      if (printWin) {
+        printWin.document.open();
+        printWin.document.write(htmlWithToolbar);
+        printWin.document.close();
+        printWin.focus();
+        return true;
+      }
+    } catch (err) {
+      console.warn('Popup print window error:', err);
+    }
+    return false;
+  };
+
+  // Synchronous Hidden Iframe Print
+  const executeHiddenIframePrint = () => {
+    const html = getPrintLabelHtml(false);
     if (!html) return;
 
-    // Direct, reliable printing for TSC TL 240
-    let printed = false;
     try {
-      const printWindow = window.open('', '_blank', 'width=750,height=550');
-      if (printWindow) {
-        printWindow.document.open();
-        printWindow.document.write(html);
-        printWindow.document.close();
-        printWindow.focus();
-        setTimeout(() => {
-          printWindow.print();
-        }, 350);
-        printed = true;
+      const existingIframe = document.getElementById('thermal-print-hidden-iframe') as HTMLIFrameElement | null;
+      if (existingIframe && existingIframe.parentNode) {
+        existingIframe.parentNode.removeChild(existingIframe);
       }
-    } catch (e) {
-      console.warn('Popup blocked, falling back to iframe:', e);
-    }
 
-    if (!printed) {
       const printFrame = document.createElement('iframe');
+      printFrame.id = 'thermal-print-hidden-iframe';
       printFrame.style.position = 'fixed';
-      printFrame.style.top = '-10000px';
-      printFrame.style.left = '-10000px';
-      printFrame.style.width = '50mm';
+      printFrame.style.left = '-9999px';
+      printFrame.style.top = '0';
+      printFrame.style.width = printConfig.labelRowType === '2-row' ? '102mm' : '50mm';
       printFrame.style.height = '20mm';
       printFrame.style.border = '0';
+      printFrame.style.visibility = 'visible';
       document.body.appendChild(printFrame);
 
       const doc = printFrame.contentWindow?.document || printFrame.contentDocument;
-      if (doc) {
+      if (doc && printFrame.contentWindow) {
         doc.open();
         doc.write(html);
         doc.close();
-        setTimeout(() => {
-          try {
-            printFrame.contentWindow?.focus();
-            printFrame.contentWindow?.print();
-          } catch (err) {
-            console.error('Print iframe error:', err);
-          }
-          setTimeout(() => {
-            if (document.body.contains(printFrame)) {
-              document.body.removeChild(printFrame);
-            }
-          }, 60000);
-        }, 300);
+        printFrame.contentWindow.focus();
+        printFrame.contentWindow.print();
+        return;
       }
-
-      // Also trigger direct HTML download so user has zero-obstacle offline print
-      handleDownloadPrintHtml();
+    } catch (err) {
+      console.warn('Hidden iframe print fallback to window.print():', err);
     }
+
+    window.focus();
+    window.print();
+  };
+
+  // Trigger print synchronously on user click gesture (preserves 100% transient user activation
+  // and prints the isolated #thermal-print-portal mounted directly on document.body)
+  const handlePrintAction = () => {
+    window.focus();
+    window.print();
   };
 
   const handleExportPDFReport = () => {
@@ -1896,7 +1921,7 @@ PRINT 1,1`;
             <div>
               <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider">Danh mục viết tắt Mã vạch</h4>
               <p className="text-[11px] text-slate-500">
-                Định nghĩa sẵn các từ viết tắt và tên của Calib/QC để kết hợp tự động in mã vạch chuẩn y tế 35x22mm.
+                Định nghĩa sẵn các từ viết tắt và tên của Calib/QC để kết hợp tự động in mã vạch chuẩn Form 2x10.
               </p>
             </div>
           </div>
@@ -2700,26 +2725,26 @@ PRINT 1,1`;
         </div>
       )}
 
-      {/* ================= MODAL: PRINT BARCODE LABELS (TSC TL 240 EXCLUSIVE) ================= */}
+      {/* ================= MODAL: PRINT BARCODE LABELS (FORM 2x10 - 100x20 mm & PRINTER CODE) ================= */}
       {isPrintModalOpen && (selectedReconForPrint || selectedBarcodeCategory) && (
         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-55">
-          <div className="bg-white rounded-3xl border border-slate-200 max-w-4xl w-full max-h-[90vh] overflow-y-auto shadow-2xl p-6 relative animate-fade-in flex flex-col">
+          <div className="bg-white rounded-3xl border border-slate-200 max-w-5xl w-full max-h-[92vh] overflow-y-auto shadow-2xl p-6 relative animate-fade-in flex flex-col">
             
             {/* Header */}
             <div className="flex items-center justify-between border-b border-slate-100 pb-4 mb-4 shrink-0">
               <div className="flex items-center gap-3">
                 <div className="h-10 w-10 rounded-2xl bg-teal-50 border border-teal-200 flex items-center justify-center text-teal-700 text-lg font-bold">
-                  🖨️
+                  🏷️
                 </div>
                 <div>
                   <h3 className="text-base font-bold text-slate-800 font-display flex items-center gap-2">
-                    In Tem Nhãn Mã Vạch - Máy in TSC TL 240
-                    <span className="bg-teal-100 text-teal-800 text-[10px] font-bold px-2 py-0.5 rounded-full border border-teal-200">
-                      Khổ chuẩn 50x20 mm
+                    In Tem Nhãn Mã Vạch - Form 2x10 cm
+                    <span className="bg-teal-100 text-teal-800 text-[10px] font-bold px-2.5 py-0.5 rounded-full border border-teal-200">
+                      Khổ tem: 100 × 20 mm
                     </span>
                   </h3>
                   <p className="text-xs text-slate-500">
-                    Tự động tạo mã vạch Code 128 vector căn giữa tuyệt đối, không nhòe, hỗ trợ in trình duyệt & BarTender.
+                    In trực tiếp cuộn decal tem 100×20mm hoặc xuất mã lệnh máy in (TSPL / ZPL) truyền thẳng vào máy in tem.
                   </p>
                 </div>
               </div>
@@ -2732,975 +2757,690 @@ PRINT 1,1`;
                 }}
                 className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-full transition-all cursor-pointer"
               >
-                <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M6 18L18 6M6 6l12 12" />
-                </svg>
+                <X className="h-5 w-5" />
               </button>
             </div>
 
-            {/* Layout Split */}
-            <div className="grid grid-cols-1 lg:grid-cols-5 gap-6 flex-1 overflow-y-auto min-h-0 pr-1">
-              
-              {/* Left Settings Panel */}
-              <div className="lg:col-span-2 space-y-4">
-                <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3">
-                  <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider border-b border-slate-200 pb-2 flex items-center justify-between">
-                    <span>Cấu hình in tem</span>
-                    <span className="text-[10px] font-mono text-teal-700 font-bold bg-teal-50 px-2 py-0.5 rounded-md border border-teal-200">TSC TL 240</span>
-                  </h4>
+            {/* Mode Tab Switcher: Direct Print vs Printer Code */}
+            <div className="flex items-center gap-2 border-b border-slate-200 pb-3 mb-4">
+              <button
+                type="button"
+                onClick={() => setPrintModalTab('label')}
+                className={`px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 cursor-pointer transition-all ${
+                  printModalTab === 'label'
+                    ? 'bg-teal-600 text-white shadow-xs'
+                    : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                }`}
+              >
+                <Printer className="h-4 w-4" /> 🏷️ In tem trực tiếp (Khổ 100 × 20 mm)
+              </button>
+              <button
+                type="button"
+                onClick={() => setPrintModalTab('code')}
+                className={`px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 cursor-pointer transition-all ${
+                  printModalTab === 'code'
+                    ? 'bg-teal-600 text-white shadow-xs'
+                    : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                }`}
+              >
+                <Code className="h-4 w-4" /> 💻 Xem & Xuất Mã Code máy in (TSPL / ZPL)
+              </button>
+            </div>
 
-                  {/* Template selector */}
-                  <div>
-                    <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Mã QC viết tắt *</label>
-                    <select
-                      value={selectedBarcodeCategory?.id || ''}
-                      onChange={(e) => {
-                        const matched = barcodeCategories.find(bc => bc.id === e.target.value);
-                        if (matched) setSelectedBarcodeCategory(matched);
-                      }}
-                      className="w-full px-3 py-2 text-xs bg-white border border-slate-200 rounded-xl focus:outline-hidden focus:border-teal-500 cursor-pointer font-medium"
-                    >
-                      <option value="">-- Chọn từ danh mục mã --</option>
-                      {barcodeCategories.map(cat => (
-                        <option key={cat.id} value={cat.id}>{cat.code} - {cat.name}</option>
-                      ))}
-                    </select>
-                    <p className="text-[9px] text-slate-400 mt-1">
-                      KTV chọn đúng tên mã QC trong menu thả xuống để hệ thống kết hợp in tự động Barcode.
-                    </p>
-                  </div>
-
-                  {/* Kích thước & Khổ giấy in nhãn */}
-                  <div>
-                    <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Khổ giấy decal của máy *</label>
-                    <select
-                      value={printConfig.labelSize}
-                      onChange={(e) => setPrintConfig({...printConfig, labelSize: e.target.value as '50x20' | '50x20_double'})}
-                      className="w-full px-3 py-2 text-xs bg-teal-50/50 border border-teal-200 rounded-xl focus:outline-hidden focus:border-teal-500 cursor-pointer font-bold text-teal-900"
-                    >
-                      <option value="50x20">1 tem/hàng · 50x20 mm (5x2 cm) [Chuẩn máy TSC TL 240]</option>
-                      <option value="50x20_double">2 tem/hàng song song · 50x20 mm (10x2 cm)</option>
-                    </select>
-                    <p className="text-[9px] text-slate-400 mt-1">
-                      Kích thước chuẩn cho cuộn decal nhiệt máy TSC TL 240.
-                    </p>
-                  </div>
-
-                  {/* Chiều in Barcode / Hướng mã vạch */}
-                  <div className="p-3 bg-white border border-teal-200 rounded-xl space-y-2.5 shadow-2xs">
-                    <div className="flex items-center justify-between">
-                      <label className="text-[10px] font-bold text-slate-700 uppercase tracking-wider flex items-center gap-1.5">
-                        <span className="text-teal-600">🔄</span> Chiều in Barcode *
-                      </label>
-                      <button
-                        type="button"
-                        onClick={() => setPrintConfig(prev => ({
-                          ...prev,
-                          barcodeOrientation: prev.barcodeOrientation === 'horizontal' ? 'vertical' : 'horizontal'
-                        }))}
-                        className="text-[10px] font-bold px-2.5 py-1 rounded-full bg-teal-50 hover:bg-teal-100 text-teal-800 border border-teal-300 transition-all cursor-pointer flex items-center gap-1 shadow-2xs"
-                        title="Bấm để đổi ngay chiều in Barcode giữa Ngang và Dọc"
-                      >
-                        <span>🔄 Đổi chiều:</span>
-                        <span className="font-extrabold text-teal-950 underline">
-                          {printConfig.barcodeOrientation === 'horizontal' ? 'Ngang ➔ Dọc' : 'Dọc ➔ Ngang'}
-                        </span>
-                      </button>
+            {printModalTab === 'label' ? (
+              /* TAB 1: DIRECT LABEL PRINTING */
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 flex-1 overflow-y-auto min-h-0 pr-1">
+                
+                {/* Left Settings Panel */}
+                <div className="lg:col-span-5 space-y-4">
+                  <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3.5">
+                    <div className="border-b border-slate-200 pb-2 flex items-center justify-between">
+                      <span className="text-xs font-bold text-slate-800 uppercase tracking-wider">Cấu hình tem 50 × 20 mm</span>
+                      <span className="text-[10px] font-mono text-teal-700 font-bold bg-teal-50 px-2 py-0.5 rounded-md border border-teal-200">
+                        {printConfig.labelRowType === '2-row' ? '2 tem/hàng (102×20mm)' : '1 tem/hàng (50×20mm)'}
+                      </span>
                     </div>
 
-                    <div className="grid grid-cols-2 gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setPrintConfig({ ...printConfig, barcodeOrientation: 'horizontal' })}
-                        className={`py-2 px-2.5 rounded-xl text-xs font-bold border transition-all cursor-pointer text-left flex items-center gap-2 ${
-                          printConfig.barcodeOrientation === 'horizontal'
-                            ? 'bg-teal-600 text-white border-teal-600 shadow-sm ring-2 ring-teal-300'
-                            : 'bg-slate-50 border-slate-200 text-slate-700 hover:bg-slate-100'
-                        }`}
-                      >
-                        <span className="text-lg font-mono leading-none">═</span>
-                        <div>
-                          <div className="leading-tight flex items-center gap-1">
-                            Ngang 0°
-                            <span className="text-[8px] px-1 py-0.2 rounded-sm bg-teal-100 text-teal-900 font-extrabold">Chuẩn</span>
+                    {/* Label Roll Row Type Selector: 1-row (50x20mm) vs 2-row (2 x 50x20mm) */}
+                    <div>
+                      <label className="block text-[10px] font-bold text-slate-600 uppercase tracking-wider mb-1.5">
+                        Loại cuộn tem (Số hàng tem) *
+                      </label>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setPrintConfig({ ...printConfig, labelRowType: '1-row' })}
+                          className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer flex flex-col gap-0.5 ${
+                            printConfig.labelRowType === '1-row'
+                              ? 'bg-teal-600 text-white border-teal-600 shadow-xs'
+                              : 'bg-white text-slate-700 border-slate-200 hover:border-teal-300 hover:bg-teal-50/40'
+                          }`}
+                        >
+                          <div className="text-xs font-bold flex items-center justify-between">
+                            <span>Loại 1 hàng tem</span>
+                            <span className={`text-[9px] px-1.5 py-0.2 rounded font-mono ${printConfig.labelRowType === '1-row' ? 'bg-teal-700 text-teal-100' : 'bg-slate-100 text-slate-600'}`}>1 tem/hàng</span>
                           </div>
-                          <div className={`text-[8.5px] font-normal ${printConfig.barcodeOrientation === 'horizontal' ? 'text-teal-100' : 'text-slate-400'}`}>Dán ngang mặt hộp / tuýp</div>
-                        </div>
-                      </button>
+                          <span className={`text-[10px] ${printConfig.labelRowType === '1-row' ? 'text-teal-100' : 'text-slate-500'}`}>
+                            Cuộn đơn 50 × 20 mm (Gap 2mm)
+                          </span>
+                        </button>
 
-                      <button
-                        type="button"
-                        onClick={() => setPrintConfig({ ...printConfig, barcodeOrientation: 'vertical' })}
-                        className={`py-2 px-2.5 rounded-xl text-xs font-bold border transition-all cursor-pointer text-left flex items-center gap-2 ${
-                          printConfig.barcodeOrientation === 'vertical'
-                            ? 'bg-teal-600 text-white border-teal-600 shadow-sm ring-2 ring-teal-300'
-                            : 'bg-slate-50 border-slate-200 text-slate-700 hover:bg-slate-100'
-                        }`}
-                      >
-                        <span className="text-lg font-mono leading-none">║</span>
-                        <div>
-                          <div className="leading-tight">Dọc 90°</div>
-                          <div className={`text-[8.5px] font-normal ${printConfig.barcodeOrientation === 'vertical' ? 'text-teal-100' : 'text-slate-400'}`}>Dán dọc thân tuýp</div>
-                        </div>
-                      </button>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-2 pt-0.5">
-                      <button
-                        type="button"
-                        onClick={() => setPrintConfig({ ...printConfig, barcodeOrientation: 'vertical270' })}
-                        className={`py-1.5 px-2 rounded-lg text-[10px] font-semibold border transition-all cursor-pointer text-center ${
-                          printConfig.barcodeOrientation === 'vertical270'
-                            ? 'bg-teal-100 border-teal-500 text-teal-900 font-bold'
-                            : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'
-                        }`}
-                      >
-                        🔁 Dọc ngược 270°
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setPrintConfig({ ...printConfig, barcodeOrientation: 'rotate180' })}
-                        className={`py-1.5 px-2 rounded-lg text-[10px] font-semibold border transition-all cursor-pointer text-center ${
-                          printConfig.barcodeOrientation === 'rotate180'
-                            ? 'bg-teal-100 border-teal-500 text-teal-900 font-bold'
-                            : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'
-                        }`}
-                      >
-                        🔃 Ngang đảo 180°
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Form tem chuẩn cố định */}
-                  <div className="p-2.5 bg-emerald-50/70 border border-emerald-200 rounded-xl flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <span className="text-base">🏷️</span>
-                      <div>
-                        <div className="text-xs font-bold text-emerald-950">Form in chuẩn cố định</div>
-                        <div className="text-[10px] text-emerald-700">Khổ 50 x 20 mm (Máy TSC TL 240)</div>
+                        <button
+                          type="button"
+                          onClick={() => setPrintConfig({ ...printConfig, labelRowType: '2-row' })}
+                          className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer flex flex-col gap-0.5 ${
+                            printConfig.labelRowType === '2-row'
+                              ? 'bg-teal-600 text-white border-teal-600 shadow-xs'
+                              : 'bg-white text-slate-700 border-slate-200 hover:border-teal-300 hover:bg-teal-50/40'
+                          }`}
+                        >
+                          <div className="text-xs font-bold flex items-center justify-between">
+                            <span>Loại 2 hàng tem</span>
+                            <span className={`text-[9px] px-1.5 py-0.2 rounded font-mono ${printConfig.labelRowType === '2-row' ? 'bg-teal-700 text-teal-100' : 'bg-slate-100 text-slate-600'}`}>2 tem/hàng</span>
+                          </div>
+                          <span className={`text-[10px] ${printConfig.labelRowType === '2-row' ? 'text-teal-100' : 'text-slate-500'}`}>
+                            Cuộn đôi 2 × (50 × 20 mm)
+                          </span>
+                        </button>
                       </div>
                     </div>
-                    <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-600 text-white shadow-2xs">
-                      ✓ Đứng form 100%
-                    </span>
+
+                    {/* Template selector */}
+                    <div>
+                      <label className="block text-[10px] font-bold text-slate-600 uppercase tracking-wider mb-1">Mã QC viết tắt *</label>
+                      <select
+                        value={selectedBarcodeCategory?.id || ''}
+                        onChange={(e) => {
+                          const matched = barcodeCategories.find(bc => bc.id === e.target.value);
+                          if (matched) setSelectedBarcodeCategory(matched);
+                        }}
+                        className="w-full px-3 py-2 text-xs bg-white border border-slate-200 rounded-xl focus:outline-hidden focus:border-teal-500 cursor-pointer font-medium"
+                      >
+                        <option value="">-- Chọn từ danh mục mã --</option>
+                        {barcodeCategories.map(cat => (
+                          <option key={cat.id} value={cat.id}>{cat.code} - {cat.name}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    {/* Quantity and Quick count buttons */}
+                    <div>
+                      <div className="flex items-center justify-between mb-1">
+                        <label className="text-[10px] font-bold text-slate-600 uppercase tracking-wider">Số lượng tem cần in</label>
+                        <span className="text-[10px] font-bold text-teal-700">
+                          {printConfig.customCount || selectedReconForPrint?.remainingAliquots || 1} tem
+                        </span>
+                      </div>
+                      <input
+                        type="number"
+                        min={1}
+                        max={200}
+                        value={printConfig.customCount || selectedReconForPrint?.remainingAliquots || 1}
+                        onChange={(e) => setPrintConfig({...printConfig, customCount: Math.max(1, parseInt(e.target.value) || 1)})}
+                        className="w-full px-3 py-1.5 text-xs bg-white border border-slate-200 rounded-xl focus:outline-hidden focus:border-teal-500 font-bold text-slate-800"
+                      />
+                      <div className="flex flex-wrap gap-1.5 mt-2">
+                        <button
+                          type="button"
+                          onClick={() => setPrintConfig({...printConfig, customCount: 1})}
+                          className="px-2.5 py-1 text-[10px] font-bold bg-white hover:bg-teal-50 text-slate-700 hover:text-teal-700 border border-slate-200 rounded-lg transition-all cursor-pointer"
+                        >
+                          1 tem
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setPrintConfig({...printConfig, customCount: 5})}
+                          className="px-2.5 py-1 text-[10px] font-bold bg-white hover:bg-teal-50 text-slate-700 hover:text-teal-700 border border-slate-200 rounded-lg transition-all cursor-pointer"
+                        >
+                          5 tem
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setPrintConfig({...printConfig, customCount: 10})}
+                          className="px-2.5 py-1 text-[10px] font-bold bg-teal-50 hover:bg-teal-100 text-teal-800 border border-teal-200 rounded-lg transition-all cursor-pointer"
+                        >
+                          10 tem
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setPrintConfig({...printConfig, customCount: 20})}
+                          className="px-2.5 py-1 text-[10px] font-bold bg-white hover:bg-teal-50 text-slate-700 hover:text-teal-700 border border-slate-200 rounded-lg transition-all cursor-pointer"
+                        >
+                          20 tem
+                        </button>
+                        {selectedReconForPrint && selectedReconForPrint.remainingAliquots !== undefined && (
+                          <button
+                            type="button"
+                            onClick={() => setPrintConfig({...printConfig, customCount: selectedReconForPrint.remainingAliquots || 1})}
+                            className="px-2.5 py-1 text-[10px] font-bold bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 rounded-lg transition-all cursor-pointer"
+                          >
+                            Số tuýp còn lại ({selectedReconForPrint.remainingAliquots})
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Toggles */}
+                    <div className="pt-2 border-t border-slate-200 space-y-2">
+                      <div className="flex items-center gap-2 py-0.5">
+                        <input
+                          type="checkbox"
+                          id="toggle-form-index"
+                          checked={printConfig.includeIndex}
+                          onChange={(e) => setPrintConfig({...printConfig, includeIndex: e.target.checked})}
+                          className="rounded-sm border-slate-300 text-teal-600 focus:ring-teal-500 h-4 w-4 cursor-pointer"
+                        />
+                        <label htmlFor="toggle-form-index" className="text-xs font-semibold text-slate-700 cursor-pointer select-none">
+                          Đánh số thứ tự tuýp tự động (#01, #02, #03...)
+                        </label>
+                      </div>
+
+                      {selectedReconForPrint && selectedReconForPrint.lotNumber && (
+                        <div className="flex items-center gap-2 py-0.5">
+                          <input
+                            type="checkbox"
+                            id="toggle-form-lot"
+                            checked={printConfig.includeLot}
+                            onChange={(e) => setPrintConfig({...printConfig, includeLot: e.target.checked})}
+                            className="rounded-sm border-slate-300 text-teal-600 focus:ring-teal-500 h-4 w-4 cursor-pointer"
+                          />
+                          <label htmlFor="toggle-form-lot" className="text-xs font-semibold text-slate-700 cursor-pointer select-none">
+                            Ghép kèm Số lô gốc ({selectedReconForPrint.lotNumber}) vào mã Barcode
+                          </label>
+                        </div>
+                      )}
+
+                      <div className="pt-1">
+                        <div className="flex items-center gap-2 py-0.5">
+                          <input
+                            type="checkbox"
+                            id="toggle-form-hospital"
+                            checked={printConfig.includeHospital}
+                            onChange={(e) => setPrintConfig({...printConfig, includeHospital: e.target.checked})}
+                            className="rounded-sm border-slate-300 text-teal-600 focus:ring-teal-500 h-4 w-4 cursor-pointer"
+                          />
+                          <label htmlFor="toggle-form-hospital" className="text-xs font-semibold text-slate-700 cursor-pointer select-none">
+                            Hiện tiêu đề Tên đơn vị / Bệnh viện
+                          </label>
+                        </div>
+                        {printConfig.includeHospital && (
+                          <input
+                            type="text"
+                            value={printConfig.hospitalName}
+                            onChange={(e) => setPrintConfig({...printConfig, hospitalName: e.target.value})}
+                            placeholder="Tên BV / Phòng xét nghiệm..."
+                            className="w-full mt-1.5 px-3 py-1.5 text-xs bg-white border border-slate-200 rounded-xl focus:outline-hidden focus:border-teal-500 font-medium"
+                          />
+                        )}
+                      </div>
+                    </div>
+
                   </div>
 
-                  {/* Label count */}
-                  <div>
-                    <label className="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Số lượng tem cần in</label>
-                    <input
-                      type="number"
-                      min={1}
-                      max={200}
-                      value={printConfig.customCount}
-                      onChange={(e) => setPrintConfig({...printConfig, customCount: parseInt(e.target.value) || 1})}
-                      className="w-full px-3 py-2 text-xs bg-white border border-slate-200 rounded-xl focus:outline-hidden focus:border-teal-500 font-mono font-bold"
-                    />
-                    <p className="text-[9px] text-slate-400 mt-1">
-                      {selectedReconForPrint 
-                        ? `Mặc định khớp với số tuýp còn lại (${selectedReconForPrint.remainingAliquots} tuýp).` 
-                        : 'Mặc định in 1 tem nhãn decal.'}
+                  {/* Thermal Printer Advice */}
+                  <div className="bg-teal-50 border border-teal-200 p-3 rounded-2xl text-[11px] text-teal-900 space-y-1">
+                    <div className="font-bold flex items-center gap-1.5 text-teal-950">
+                      <span>💡 Hướng dẫn in trực tiếp chuẩn Khổ 2x10 cm (100×20 mm):</span>
+                    </div>
+                    <p>1. Trong hộp thoại in của trình duyệt (Ctrl+P):</p>
+                    <div className="bg-white/80 p-2 rounded-lg border border-teal-100 text-[10.5px] space-y-0.5 font-medium">
+                      <div>• <strong>Khổ giấy (Paper size):</strong> Chọn <strong>100 × 20 mm</strong> (hoặc Custom / User-Defined).</div>
+                      <div>• <strong>Lề (Margins):</strong> Chọn <strong>Không có (None)</strong>.</div>
+                      <div>• <strong>Tỷ lệ (Scale):</strong> Chọn <strong>100%</strong> (hoặc Vừa trang).</div>
+                    </div>
+                    <p className="text-[10px] text-slate-500">
+                      Nếu máy in nhiệt của bạn dùng phần mềm chuyên dụng, chuyển sang tab <strong>"Xem & Xuất Mã Code máy in"</strong> để lấy mã TSPL/ZPL.
                     </p>
                   </div>
+                </div>
 
-                  {/* Lot suffix toggle */}
-                  {selectedReconForPrint && (
-                    <div className="flex items-center gap-2 py-1">
-                      <input
-                        type="checkbox"
-                        id="toggle-print-lot"
-                        checked={printConfig.includeLot}
-                        onChange={(e) => setPrintConfig({...printConfig, includeLot: e.target.checked})}
-                        className="rounded-sm border-slate-300 text-teal-600 focus:ring-teal-500 h-4 w-4 cursor-pointer"
-                      />
-                      <label htmlFor="toggle-print-lot" className="text-xs font-semibold text-slate-600 cursor-pointer select-none">
-                        Ghép kèm Số lô của hộp gốc ({selectedReconForPrint.lotNumber})
-                      </label>
-                    </div>
-                  )}
-
-                  {/* Tube index toggle */}
-                  <div className="flex items-center gap-2 py-1">
-                    <input
-                      type="checkbox"
-                      id="toggle-print-index"
-                      checked={printConfig.includeIndex}
-                      onChange={(e) => setPrintConfig({...printConfig, includeIndex: e.target.checked})}
-                      className="rounded-sm border-slate-300 text-teal-600 focus:ring-teal-500 h-4 w-4 cursor-pointer"
-                    />
-                    <label htmlFor="toggle-print-index" className="text-xs font-semibold text-slate-600 cursor-pointer select-none">
-                      Đánh số thứ tự tuýp tự động (01, 02, 03...)
-                    </label>
-                  </div>
-
-                  {/* Hospital header toggle */}
-                  <div className="pt-2 border-t border-slate-200">
-                    <div className="flex items-center gap-2 py-1">
-                      <input
-                        type="checkbox"
-                        id="toggle-print-hospital"
-                        checked={printConfig.includeHospital}
-                        onChange={(e) => setPrintConfig({...printConfig, includeHospital: e.target.checked})}
-                        className="rounded-sm border-slate-300 text-teal-600 focus:ring-teal-500 h-4 w-4 cursor-pointer"
-                      />
-                      <label htmlFor="toggle-print-hospital" className="text-xs font-semibold text-slate-700 cursor-pointer select-none">
-                        Hiện tên đơn vị / Bệnh viện
-                      </label>
-                    </div>
-                    {printConfig.includeHospital && (
-                      <input
-                        type="text"
-                        value={printConfig.hospitalName}
-                        onChange={(e) => setPrintConfig({...printConfig, hospitalName: e.target.value})}
-                        placeholder="Nhập tên đơn vị / BV..."
-                        className="w-full mt-1 px-2.5 py-1.5 text-xs bg-white border border-slate-200 rounded-xl focus:outline-hidden focus:border-teal-500 font-medium"
-                      />
-                    )}
-                  </div>
-
-                  {/* Barcode height selection for 2x5cm */}
-                  <div className="pt-2 border-t border-slate-200">
-                    <div className="flex items-center justify-between mb-1">
-                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">
-                        Độ cao mã vạch (Tem 2x5cm)
-                      </label>
-                      <span className="text-[9px] font-bold px-1.5 py-0.5 rounded-full bg-teal-100 text-teal-800">
-                        {printConfig.barcodeHeight === 8.5 ? '8.5 mm' : '7.5 mm (Khuyên dùng)'}
+                {/* Right Live Preview Panel */}
+                <div className="lg:col-span-7 bg-slate-100 border border-slate-200 rounded-2xl p-4 flex flex-col min-h-0">
+                  <div className="flex items-center justify-between border-b border-slate-200 pb-2 mb-3 shrink-0 flex-wrap gap-2">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-bold text-slate-700 uppercase tracking-wider flex items-center gap-1.5">
+                        📺 Xem trước cuộn tem ({printConfig.labelRowType === '2-row' ? 'Loại 2 hàng tem · 2 tem/hàng' : 'Loại 1 hàng tem · 1 tem/hàng'})
                       </span>
                     </div>
-                    <div className="grid grid-cols-2 gap-1.5">
-                      <button
-                        type="button"
-                        onClick={() => setPrintConfig({...printConfig, barcodeHeight: 7.5})}
-                        className={`py-1.5 px-2 rounded-xl text-xs font-bold border transition-all cursor-pointer text-center ${
-                          (printConfig.barcodeHeight || 7.5) === 7.5
-                            ? 'bg-teal-50 border-teal-500 text-teal-900 shadow-2xs'
-                            : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'
-                        }`}
-                      >
-                        <div>Chuẩn 7.5 mm</div>
-                        <div className="text-[9px] font-normal text-slate-500">Cân đối đẹp nhất</div>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setPrintConfig({...printConfig, barcodeHeight: 8.5})}
-                        className={`py-1.5 px-2 rounded-xl text-xs font-bold border transition-all cursor-pointer text-center ${
-                          printConfig.barcodeHeight === 8.5
-                            ? 'bg-teal-50 border-teal-500 text-teal-900 shadow-2xs'
-                            : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'
-                        }`}
-                      >
-                        <div>Lớn 8.5 mm</div>
-                        <div className="text-[9px] font-normal text-slate-500">Mã vạch cao hơn</div>
-                      </button>
-                    </div>
-                  </div>
-                </div>
-
-                {/* 2x5cm Sizing & Troubleshooting banner */}
-                <div className="bg-amber-50 border-2 border-amber-300 p-3 rounded-2xl shadow-xs space-y-2">
-                  <div className="flex items-center gap-1.5 text-xs font-bold text-amber-950">
-                    <span>⚠️</span>
-                    <span>Khắc phục lỗi in bị khoảng trống dài ở dưới (như giấy A4):</span>
-                  </div>
-                  <div className="text-[11px] text-amber-900 leading-relaxed space-y-1">
-                    <p>Khi hộp thoại in của trình duyệt (Ctrl+P) hiện lên, cần lưu ý 2 cài đặt:</p>
-                    <div className="bg-white/80 p-2 rounded-lg border border-amber-200 text-[10.5px] space-y-1 font-medium">
-                      <div>1. <strong>Máy in (Destination):</strong> Phải chọn đúng máy in <strong>TSC TL 240</strong> (hoặc tên máy in mã vạch).</div>
-                      <div>2. <strong>Khổ giấy (Paper size):</strong> Bấm <em>Cài đặt khác (More settings)</em> ➔ <strong>Khổ giấy</strong> ➔ Chọn đúng <strong>50 x 20 mm</strong> (hoặc USER / 2.00x0.79 in). <em>Nếu để A4 thì máy sẽ nhả giấy trống cả đoạn dài!</em></div>
-                      <div>3. <strong>Lề (Margins):</strong> Chọn <strong>Không có (None)</strong> · <strong>Tỷ lệ (Scale):</strong> 100%.</div>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Hardware & Calibration helper box */}
-                <div className="bg-blue-50 border-2 border-blue-300 p-3 rounded-2xl shadow-xs space-y-2">
-                  <div className="flex items-start justify-between gap-2">
-                    <div className="flex items-start gap-2">
-                      <span className="text-lg">⚙️</span>
-                      <div>
-                        <h4 className="text-xs font-bold text-blue-950">
-                          Mẹo căn giữa 100% trên máy TSC TL 240:
-                        </h4>
-                        <p className="text-[11px] text-blue-800 leading-relaxed mt-0.5">
-                          1. Gạt <strong>2 thanh kẹp màu xanh</strong> ép sát 2 bên mép cuộn tem.<br/>
-                          2. Nhấn giữ nút <strong>FEED</strong> để máy tự Calibrate khoảng cách tem (Gap).
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => setIsTSCGuideOpen(true)}
-                    className="w-full py-1.5 px-3 bg-blue-600 hover:bg-blue-700 text-white text-[11px] font-bold rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5 shadow-xs"
-                  >
-                    <span>🛠️ Xem 4 bước cân chỉnh chi tiết máy TSC TL 240</span>
-                  </button>
-                </div>
-
-                {/* BarTender / TSPL export box */}
-                <div className="bg-gradient-to-br from-indigo-50/90 to-blue-50/90 border border-indigo-200 p-3 rounded-2xl shadow-xs space-y-2">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-1.5">
-                      <span className="text-base">🏷️</span>
-                      <h4 className="text-xs font-bold text-indigo-950">
-                        Xuất dữ liệu cho BarTender Enterprise
-                      </h4>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setIsBarTenderGuideOpen(true)}
-                      className="text-[10px] text-indigo-700 hover:text-indigo-900 font-bold underline cursor-pointer"
-                    >
-                      📖 Hướng dẫn
-                    </button>
-                  </div>
-                  <div className="grid grid-cols-3 gap-1.5 pt-0.5">
-                    <button
-                      type="button"
-                      onClick={handleExportBarTenderCSV}
-                      className="p-1.5 bg-white hover:bg-indigo-50 border border-indigo-200 text-indigo-900 rounded-xl text-[10px] font-bold transition-all flex flex-col items-center justify-center gap-0.5 shadow-2xs cursor-pointer"
-                    >
-                      <span>📊 Xuất CSV</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleExportBarTenderXML}
-                      className="p-1.5 bg-white hover:bg-indigo-50 border border-indigo-200 text-indigo-900 rounded-xl text-[10px] font-bold transition-all flex flex-col items-center justify-center gap-0.5 shadow-2xs cursor-pointer"
-                    >
-                      <span>⚡ BTXML</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleExportTSPL}
-                      className="p-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-[10px] font-bold transition-all flex flex-col items-center justify-center gap-0.5 shadow-2xs cursor-pointer"
-                      title="Tải mã lệnh TSPL (.tspl / .prn) căn giữa chuẩn cho máy in TSC TL 240"
-                    >
-                      <span>🖨️ Lệnh TSPL</span>
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-              {/* Right Live Preview Panel */}
-              <div className="lg:col-span-3 bg-slate-100 border border-slate-200 rounded-2xl p-4 flex flex-col min-h-0">
-                <div className="flex items-center justify-between border-b border-slate-200 pb-2 mb-3 shrink-0 flex-wrap gap-2">
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs font-bold text-slate-700 uppercase tracking-wider flex items-center gap-1.5">
-                      📺 Xem trước tem in thực tế (TSC TL 240 · 50x20mm)
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => setPrintConfig(prev => ({
-                        ...prev,
-                        barcodeOrientation: prev.barcodeOrientation === 'horizontal' ? 'vertical' : 'horizontal'
-                      }))}
-                      className="px-2.5 py-1 text-[10px] font-bold text-teal-800 bg-teal-50 hover:bg-teal-100 border border-teal-300 rounded-lg transition-all cursor-pointer flex items-center gap-1 shadow-2xs"
-                      title="Chuyển đổi tức thì giữa in mã vạch Ngang 0° và Dọc 90°"
-                    >
-                      <span>🔄 Đổi chiều Barcode:</span>
-                      <span className="font-extrabold text-teal-950 underline">
-                        {printConfig.barcodeOrientation === 'horizontal' ? 'Ngang ➔ Dọc' : 'Dọc ➔ Ngang'}
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full text-emerald-800 bg-emerald-50 border border-emerald-200">
+                        {printConfig.labelRowType === '2-row' ? '2 × (50×20 mm) / hàng' : '100 × 20 mm / hàng'}
                       </span>
-                    </button>
+                      <span className="text-[10px] font-mono font-bold text-slate-600 bg-white px-2 py-0.5 rounded-full border border-slate-200">
+                        {getPreparedLabels().length} tem ({printConfig.labelRowType === '2-row' ? `${Math.ceil(getPreparedLabels().length / 2)} hàng` : `${getPreparedLabels().length} hàng`})
+                      </span>
+                    </div>
                   </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full text-emerald-800 bg-emerald-50 border border-emerald-200">
-                      ✓ Đứng form 50x20mm
-                    </span>
-                    <span className="text-[10px] font-mono font-bold text-slate-500 bg-white px-2 py-0.5 rounded-full border border-slate-200">
-                      {printConfig.labelSize === '50x20' ? '1 tem / hàng' : '2 tem / hàng song song'}
-                    </span>
-                  </div>
-                </div>
 
-                {/* decall strip scroll list */}
-                <div className="flex-1 overflow-y-auto space-y-3 p-4 bg-slate-200 rounded-xl min-h-[300px] flex flex-col justify-start">
-                  {(() => {
-                    const labelCount = printConfig.customCount || selectedReconForPrint?.remainingAliquots || selectedReconForPrint?.aliquotsCount || 1;
-                    const labels = [];
-                    for (let i = 1; i <= labelCount; i++) {
-                      const tubeIndex = String(i).padStart(2, '0');
-                      let barcodeValue = selectedBarcodeCategory?.code || 'QC';
-                      if (printConfig.includeLot && selectedReconForPrint?.lotNumber) {
-                        barcodeValue += `-${selectedReconForPrint.lotNumber}`;
-                      }
-                      if (printConfig.includeIndex) {
-                        barcodeValue += `-${tubeIndex}`;
-                      }
-                      
-                      labels.push({
-                        index: tubeIndex,
-                        barcodeValue,
-                        displayName: selectedBarcodeCategory?.name || selectedReconForPrint?.targetItemName || '',
-                        lot: selectedReconForPrint?.lotNumber || '',
-                        expiry: selectedReconForPrint ? formatDateVN(selectedReconForPrint.expiryTimestamp) : '',
-                        preparedBy: selectedReconForPrint?.preparedBy || '',
-                      });
-                    }
-
-                    const labelRows = [];
-                    const itemsPerRow = printConfig.labelSize === '50x20' ? 1 : 2;
-                    for (let i = 0; i < labels.length; i += itemsPerRow) {
-                      if (itemsPerRow === 1) {
-                        labelRows.push([labels[i]]);
-                      } else {
-                        labelRows.push([labels[i], labels[i + 1]]);
-                      }
-                    }
-
-                    if (labelRows.length === 0) {
-                      return (
-                        <div className="text-center p-8 text-slate-400 my-auto">
-                          Chọn cấu hình in nhãn để tạo dải nhãn xem trước.
-                        </div>
-                      );
-                    }
-
-                    const isVertical = printConfig.barcodeOrientation === 'vertical' || printConfig.barcodeOrientation === 'vertical270';
-                    const isRot180 = printConfig.barcodeOrientation === 'rotate180';
-                    const rotClass = printConfig.barcodeOrientation === 'vertical270' ? '-rotate-90' : 'rotate-90';
-
-                    const renderLabelCard = (item: typeof labels[0]) => {
-                      if (isVertical) {
+                  {/* Label preview area */}
+                  <div className="flex-1 overflow-y-auto space-y-3 p-3 bg-slate-200 rounded-xl min-h-[360px] max-h-[500px]">
+                    {(() => {
+                      const labels = getPreparedLabels();
+                      if (labels.length === 0) {
                         return (
-                          <div className="label-preview-item-50x20 relative !flex !flex-row !justify-between !items-stretch !p-[1mm_1.5mm] !text-left shadow-xs">
-                            {/* Left Column: Barcode Vertical */}
-                            <div className="w-[18mm] h-[18.2mm] flex flex-col items-center justify-center shrink-0 overflow-hidden bg-slate-50 rounded-xs">
-                              <div className={`flex flex-col items-center justify-center w-[16mm] h-[16mm] ${rotClass}`}>
-                                <BarcodeRenderer 
-                                  value={item.barcodeValue} 
-                                  heightMm={6.0}
-                                  isVertical={true}
-                                />
-                                <div className="text-[7px] font-mono font-black text-slate-950 tracking-wider text-center mt-0.5 leading-none">
-                                  {item.barcodeValue}
-                                </div>
-                              </div>
-                            </div>
-
-                            {/* Right Column: Info */}
-                            <div className="flex-1 h-[18.2mm] flex flex-col justify-between pl-1.5 border-l border-dashed border-slate-300 min-w-0">
-                              {printConfig.includeHospital && printConfig.hospitalName && (
-                                <div className="text-[6px] font-bold text-slate-600 uppercase tracking-tight truncate leading-none">
-                                  {printConfig.hospitalName}
-                                </div>
-                              )}
-                              <div className="font-black text-slate-950 text-[8.5px] leading-tight line-clamp-2">
-                                {item.displayName}
-                              </div>
-                              <div className="text-[7px] font-bold text-slate-700 leading-tight">
-                                <div>LOT: {item.lot || '---'}</div>
-                                <div>HSD: {item.expiry}</div>
-                              </div>
-                              {item.index ? (
-                                <div className="text-[7.5px] font-black text-teal-700 text-right leading-none">
-                                  Tuýp #{item.index}
-                                </div>
-                              ) : (
-                                <div className="text-[6.5px] font-semibold text-slate-400 text-right leading-none">
-                                  50x20mm
-                                </div>
-                              )}
-                            </div>
+                          <div className="text-center py-12 text-slate-400 text-xs italic">
+                            Chưa có tem nào được chọn.
                           </div>
                         );
                       }
 
-                      return (
-                        <div className={`label-preview-item-50x20 relative ${isRot180 ? 'rotate-180' : ''} shadow-xs`}>
-                          {printConfig.includeHospital && printConfig.hospitalName && (
-                            <div className="text-[6.5px] font-bold text-slate-700 uppercase tracking-wider text-center truncate w-full leading-none mb-0.5">
-                              {printConfig.hospitalName}
-                            </div>
-                          )}
-                          <div className={`font-black text-slate-950 text-center truncate w-full leading-tight ${printConfig.includeHospital ? 'text-[8.5px]' : 'text-[10px]'}`}>
+                      if (printConfig.labelRowType === '2-row') {
+                        const pairedRows = getPairedLabelRows();
+                        return pairedRows.map((pair, rowIdx) => (
+                          <div
+                            key={rowIdx}
+                            className="grid grid-cols-2 gap-2.5 mx-auto max-w-[460px] bg-slate-300/60 p-1.5 rounded-xl border border-dashed border-slate-400"
+                          >
+                            {pair.map((item, colIdx) =>
+                              item ? (
+                                <div
+                                  key={colIdx}
+                                  className="bg-white rounded-lg shadow-xs border border-slate-300 p-2 transition-all hover:border-teal-500"
+                                >
+                                  <div className="flex items-center justify-between text-[7.5px] font-bold text-slate-900 border-b border-slate-200 pb-0.5 leading-none">
+                                    <span className="truncate max-w-[115px] uppercase">{item.hospitalName || 'Khoa XN'}</span>
+                                    {item.index && <span className="text-teal-700 font-extrabold">#{item.index}</span>}
+                                  </div>
+                                  <div className="text-[8.5px] font-bold text-slate-950 truncate mt-0.5 leading-tight">
+                                    {item.displayName}
+                                  </div>
+                                  <div className="my-1 flex flex-col items-center justify-center">
+                                    <BarcodeRenderer
+                                      value={item.barcodeValue}
+                                      heightMm={7.0}
+                                      maxWidthMm={40}
+                                      isVertical={false}
+                                    />
+                                    <div className="text-[7px] font-mono font-black text-slate-900 tracking-wide mt-0.5 leading-none">
+                                      {item.barcodeValue}
+                                    </div>
+                                  </div>
+                                  <div className="flex items-center justify-between text-[6.5px] font-bold text-slate-700 border-t border-slate-800 pt-0.5 mt-0.5 leading-none">
+                                    <span>LOT:{item.lot || '--'}</span>
+                                    <span>HSD:{item.expiry}</span>
+                                  </div>
+                                </div>
+                              ) : (
+                                <div
+                                  key={colIdx}
+                                  className="bg-slate-200/50 rounded-lg border border-dashed border-slate-300 p-2 flex items-center justify-center text-[10px] text-slate-400 italic"
+                                >
+                                  (Tem trống)
+                                </div>
+                              )
+                            )}
+                          </div>
+                        ));
+                      }
+
+                      return labels.map((item, idx) => (
+                        <div 
+                          key={idx}
+                          className="bg-white rounded-lg shadow-sm border border-slate-300 p-2.5 mx-auto max-w-[420px] transition-all hover:border-teal-500 hover:shadow-md"
+                        >
+                          <div className="flex items-center justify-between text-[8px] font-bold text-slate-900 border-b border-slate-200 pb-0.5 leading-none">
+                            <span className="truncate max-w-[240px] uppercase">{item.hospitalName || 'Khoa Xét Nghiệm'}</span>
+                            {item.index && <span className="text-teal-700 font-extrabold">Tuýp #{item.index}</span>}
+                          </div>
+                          <div className="text-[10px] font-bold text-slate-950 truncate mt-1 leading-tight">
                             {item.displayName}
                           </div>
-                          <div className="flex-1 flex flex-col justify-center items-center w-full text-center my-0.5">
+                          <div className="my-1.5 flex flex-col items-center justify-center">
                             <BarcodeRenderer 
                               value={item.barcodeValue} 
-                              heightMm={printConfig.includeHospital ? 7.0 : (printConfig.barcodeHeight || 8.0)}
+                              heightMm={7.8}
+                              maxWidthMm={68}
                               isVertical={false}
                             />
+                            <div className="text-[8px] font-mono font-black text-slate-900 tracking-wider mt-0.5 leading-none">
+                              {item.barcodeValue}
+                            </div>
                           </div>
-                          <div className="text-[8.5px] font-mono font-black text-center text-slate-950 tracking-wider w-full leading-none">
-                            {item.barcodeValue}
-                          </div>
-                          <div className="flex items-center justify-between text-[7.2px] font-bold text-slate-900 border-t border-slate-900 pt-0.5 mt-0.5 w-full leading-none">
-                            <span className="truncate max-w-[20mm]">LOT: {item.lot || '---'}</span>
+                          <div className="flex items-center justify-between text-[7.5px] font-bold text-slate-700 border-t border-slate-800 pt-1 mt-0.5 leading-none">
+                            <span>LOT: {item.lot || '---'}</span>
                             <span>HSD: {item.expiry}</span>
-                            {item.index && <span>#{item.index}</span>}
+                            <span>{item.preparedBy ? `KTV: ${item.preparedBy}` : ''}</span>
                           </div>
                         </div>
-                      );
-                    };
+                      ));
+                    })()}
+                  </div>
+                </div>
 
-                    return labelRows.map((row, rIndex) => (
-                      <div key={rIndex} className="flex gap-4 justify-center items-center">
-                        {/* Label 1 Preview */}
-                        {row[0] && renderLabelCard(row[0])}
-
-                        {/* Label 2 Preview */}
-                        {itemsPerRow === 2 && (
-                          row[1] ? renderLabelCard(row[1]) : (
-                            <div 
-                              className="border-2 border-dashed border-slate-300 rounded-md flex items-center justify-center text-[10px] text-slate-400 italic bg-white/50"
-                              style={{ width: '50mm', height: '20mm' }}
-                            >
-                              Trống (Lẻ hàng)
-                            </div>
-                          )
-                        )}
+              </div>
+            ) : (
+              /* TAB 2: PRINTER CODE (TSPL / ZPL) */
+              <div className="space-y-4 flex-1 overflow-y-auto min-h-0">
+                <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-4">
+                  <div className="flex flex-wrap items-center gap-4">
+                    <div>
+                      <span className="text-[10px] font-bold text-slate-600 uppercase tracking-wider block mb-1">
+                        Ngôn ngữ lệnh máy in
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => setPrinterCodeFormat('TSPL')}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer transition-all ${
+                            printerCodeFormat === 'TSPL'
+                              ? 'bg-teal-600 text-white shadow-xs'
+                              : 'bg-white text-slate-700 border border-slate-300 hover:bg-slate-100'
+                          }`}
+                        >
+                          TSPL (Xprinter, TSC, Godex, Gprinter...)
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setPrinterCodeFormat('ZPL')}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer transition-all ${
+                            printerCodeFormat === 'ZPL'
+                              ? 'bg-teal-600 text-white shadow-xs'
+                              : 'bg-white text-slate-700 border border-slate-300 hover:bg-slate-100'
+                          }`}
+                        >
+                          ZPL (Zebra)
+                        </button>
                       </div>
-                    ));
-                  })()}
+                    </div>
+
+                    <div>
+                      <span className="text-[10px] font-bold text-slate-600 uppercase tracking-wider block mb-1">
+                        Loại cuộn tem (Số hàng tem)
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => setPrintConfig({ ...printConfig, labelRowType: '1-row' })}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer transition-all ${
+                            printConfig.labelRowType === '1-row'
+                              ? 'bg-teal-600 text-white shadow-xs'
+                              : 'bg-white text-slate-700 border border-slate-300 hover:bg-slate-100'
+                          }`}
+                        >
+                          Loại 1 hàng tem (50×20mm)
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setPrintConfig({ ...printConfig, labelRowType: '2-row' })}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer transition-all ${
+                            printConfig.labelRowType === '2-row'
+                              ? 'bg-teal-600 text-white shadow-xs'
+                              : 'bg-white text-slate-700 border border-slate-300 hover:bg-slate-100'
+                          }`}
+                        >
+                          Loại 2 hàng tem (2×50×20mm)
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] font-mono font-bold text-teal-800 bg-teal-50 px-3 py-1 rounded-full border border-teal-200">
+                      {printConfig.labelRowType === '2-row'
+                        ? `Khổ 102×20mm (2 tem/hàng) · ${getPreparedLabels().length} tem (${Math.ceil(getPreparedLabels().length / 2)} lệnh PRINT)`
+                        : `Khổ 50×20mm (1 tem/hàng) · ${getPreparedLabels().length} lệnh PRINT`}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Code Block Container */}
+                <div className="relative">
+                  <div className="flex items-center justify-between bg-slate-800 text-slate-300 px-4 py-2 rounded-t-xl text-xs font-mono">
+                    <span>
+                      Mã lệnh in {printerCodeFormat} ({printConfig.labelRowType === '2-row' ? 'Loại 2 hàng tem - SIZE 102x20mm / ^PW816' : 'Loại 1 hàng tem - SIZE 50x20mm / ^PW400'})
+                    </span>
+                    <span className="text-[10px] text-emerald-400 font-bold">✓ Chuẩn ASCII không dấu (BarTender / Zebra Ready)</span>
+                  </div>
+                  <pre className="bg-slate-900 text-emerald-400 p-4 rounded-b-xl font-mono text-xs overflow-x-auto max-h-[360px] select-all leading-relaxed">
+                    {generatePrinterCode(getPreparedLabels(), printerCodeFormat, printConfig.labelRowType)}
+                  </pre>
+                </div>
+
+                {/* Integration advice */}
+                <div className="bg-amber-50 border border-amber-200 p-3 rounded-2xl text-[11px] text-amber-900 space-y-1">
+                  <div className="font-bold flex items-center gap-1.5 text-amber-950">
+                    <span>💡 Cách sử dụng mã code in (Đã lọc sạch dấu tiếng Việt bằng removeAccents):</span>
+                  </div>
+                  <div>• <strong>TSC / Xprinter / Godex (TSPL):</strong> Dán trực tiếp vào <em>BarTender</em>, <em>DiagTool</em> hoặc <em>TSC Console</em> (SIZE 50x20mm, GAP 2mm, BARCODE 128).</div>
+                  <div>• <strong>Zebra (ZPL):</strong> Mở <em>Zebra Setup Utilities</em> ➔ <em>Open Communication With Printer</em> ➔ Dán mã ZPL (^PW400, ^LL160, ^BCN) và bấm <em>Send to Printer</em>.</div>
+                  <div>• <strong>Tự động hóa:</strong> Nhúng file mã in vào phần mềm LIS/HIS gửi qua socket TCP port 9100 để in tự động.</div>
                 </div>
               </div>
+            )}
 
-            </div>
-
-            {/* Print Dialog Actions */}
-            <div className="mt-6 pt-4 border-t border-slate-100 flex flex-wrap items-center justify-between gap-3 shrink-0">
-              <div className="flex items-center gap-2">
+            {/* Pre-Print Checklist Reminder Banner (Always visible before printing) */}
+            {printModalTab === 'label' && (
+              <div className="mt-4 bg-amber-50 border border-amber-200 rounded-2xl p-3 text-xs text-amber-950 flex flex-wrap items-center justify-between gap-2 shrink-0">
+                <div className="flex items-center gap-2">
+                  <AlertTriangle className="h-4 w-4 text-amber-600 shrink-0" />
+                  <span>
+                    <strong>Kiểm tra hộp thoại In:</strong> Khổ giấy (Paper Size):{' '}
+                    <strong className="text-teal-800 underline">
+                      {printConfig.labelRowType === '2-row' ? '102 × 20 mm (hoặc 100 × 20 mm)' : '50 × 20 mm'}
+                    </strong>{' '}
+                    · Lề (Margins): <strong>None</strong> · Tỷ lệ (Scale): <strong className="text-rose-600">100%</strong> (Không chọn Fit to Page)
+                  </span>
+                </div>
                 <button
                   type="button"
-                  onClick={handleExportBarTenderCSV}
-                  className="px-3.5 py-2 text-xs text-indigo-700 bg-indigo-50 hover:bg-indigo-100 rounded-xl transition-all cursor-pointer font-bold border border-indigo-200 flex items-center gap-1.5 shadow-2xs"
-                  title="Tải file CSV chứa toàn bộ thông tin lô tem để nhập vào BarTender in"
+                  onClick={() => setIsPrePrintOverlayOpen(true)}
+                  className="text-[11px] font-bold text-teal-700 hover:text-teal-900 underline cursor-pointer shrink-0"
                 >
-                  <span>📊 Xuất CSV BarTender</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={handleExportTSPL}
-                  className="px-3.5 py-2 text-xs text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-xl transition-all cursor-pointer font-bold border border-blue-200 flex items-center gap-1.5 shadow-2xs"
-                  title="Tải file lệnh TSPL (.prn / .tspl) chuẩn phần cứng TSC TL 240"
-                >
-                  <span>⚡ Tải mã TSPL (.tspl)</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setIsTSCGuideOpen(true)}
-                  className="px-3 py-2 text-xs text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl transition-all cursor-pointer font-bold border border-slate-200 flex items-center gap-1"
-                >
-                  <span>🛠️ Căn lề máy in</span>
+                  Xem hướng dẫn chi tiết
                 </button>
               </div>
+            )}
 
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={handleDownloadPrintHtml}
-                  className="px-3.5 py-2 text-xs text-teal-700 bg-teal-50 hover:bg-teal-100 rounded-xl transition-all cursor-pointer font-bold border border-teal-200 flex items-center gap-1.5 shadow-2xs"
-                  title="Tải file HTML chuẩn khổ 50x20mm để mở trực tiếp trên trình duyệt hoặc in độc lập"
-                >
-                  <Download className="h-3.5 w-3.5" />
-                  <span>Tải file in (HTML)</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setIsPrintModalOpen(false);
-                    setSelectedReconForPrint(null);
-                    setSelectedBarcodeCategory(null);
-                  }}
-                  className="px-4 py-2 text-xs text-slate-500 bg-slate-50 hover:bg-slate-100 rounded-xl transition-all cursor-pointer border border-slate-200 font-semibold"
-                >
-                  Hủy bỏ
-                </button>
-                <button
-                  type="button"
-                  onClick={handlePrintAction}
-                  className="px-6 py-2.5 text-xs text-white bg-teal-600 hover:bg-teal-700 rounded-xl transition-all cursor-pointer font-bold shadow-md hover:shadow-lg flex items-center gap-2 text-sm"
-                >
-                  <Printer className="h-4 w-4" /> BẮT ĐẦU IN (MÁY TSC TL 240)
-                </button>
+            {/* Modal Actions */}
+            <div className="mt-3 pt-3 border-t border-slate-100 flex flex-wrap items-center justify-between gap-3 shrink-0">
+              <div className="text-xs text-slate-500 font-medium">
+                Khổ tem chuẩn: <strong>{printConfig.labelRowType === '2-row' ? '102 × 20 mm (2 tem 50×20mm, Gap 2mm)' : '50 × 20 mm (1 tem đơn, Gap 2mm, Safe Margin 1.5–2mm)'}</strong>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                {printModalTab === 'code' ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={handleDownloadPrinterCode}
+                      className="px-4 py-2 text-xs text-teal-700 bg-teal-50 hover:bg-teal-100 rounded-xl transition-all cursor-pointer font-bold border border-teal-200 flex items-center gap-1.5 shadow-2xs"
+                    >
+                      <Download className="h-3.5 w-3.5" />
+                      <span>Tải file mã in (.{printerCodeFormat.toLowerCase()})</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleCopyPrinterCode}
+                      className="px-5 py-2 text-xs text-white bg-teal-600 hover:bg-teal-700 rounded-xl transition-all cursor-pointer font-bold shadow-md hover:shadow-lg flex items-center gap-2"
+                    >
+                      {copiedCode ? <CheckCircle className="h-4 w-4 text-white" /> : <Copy className="h-4 w-4" />}
+                      <span>{copiedCode ? 'Đã sao chép mã!' : 'Sao chép mã Code'}</span>
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={handleDownloadPrintHtml}
+                      className="px-3 py-2 text-xs text-teal-700 bg-teal-50 hover:bg-teal-100 rounded-xl transition-all cursor-pointer font-bold border border-teal-200 flex items-center gap-1.5 shadow-2xs"
+                      title="Tải file HTML chuẩn khổ 50x20mm để mở trên mọi máy tính hoặc in offline"
+                    >
+                      <Download className="h-3.5 w-3.5" />
+                      <span>Tải file HTML</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleOpenPrintWindow}
+                      className="px-3 py-2 text-xs text-indigo-700 bg-indigo-50 hover:bg-indigo-100 rounded-xl transition-all cursor-pointer font-bold border border-indigo-200 flex items-center gap-1.5 shadow-2xs"
+                      title="Mở cửa sổ in độc lập trong tab mới"
+                    >
+                      <ArrowUpRight className="h-3.5 w-3.5" />
+                      <span>Mở Tab In Riêng</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsPrintModalOpen(false);
+                        setIsPrePrintOverlayOpen(false);
+                        setSelectedReconForPrint(null);
+                        setSelectedBarcodeCategory(null);
+                      }}
+                      className="px-3.5 py-2 text-xs text-slate-500 bg-slate-50 hover:bg-slate-100 rounded-xl transition-all cursor-pointer border border-slate-200 font-semibold"
+                    >
+                      Hủy bỏ
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handlePrintAction}
+                      className="px-6 py-2.5 text-xs text-white bg-teal-600 hover:bg-teal-700 rounded-xl transition-all cursor-pointer font-bold shadow-md hover:shadow-lg flex items-center gap-2 text-sm"
+                    >
+                      <Printer className="h-4 w-4" /> BẮT ĐẦU IN ({printConfig.labelRowType === '2-row' ? '2 × 50×20 mm' : '50 × 20 mm'})
+                    </button>
+                  </>
+                )}
               </div>
             </div>
+
+            {/* ================= PRE-PRINT REMINDER OVERLAY (HƯỚNG DẪN KIỂM TRA NHANH TRƯỚC KHI IN) ================= */}
+            {isPrePrintOverlayOpen && (
+              <div className="fixed inset-0 bg-slate-900/70 backdrop-blur-xs flex items-center justify-center p-4 z-70 animate-fade-in">
+                <div className="bg-white rounded-3xl border-2 border-teal-500 max-w-lg w-full p-6 shadow-2xl space-y-4">
+                  <div className="flex items-start justify-between gap-3 border-b border-slate-100 pb-3">
+                    <div className="flex items-center gap-2.5">
+                      <div className="h-10 w-10 rounded-2xl bg-amber-100 border border-amber-300 flex items-center justify-center text-lg">
+                        ⚠️
+                      </div>
+                      <div>
+                        <h4 className="text-sm font-bold text-slate-900 uppercase tracking-wide">
+                          Kiểm tra nhanh thông số Hộp thoại In
+                        </h4>
+                        <p className="text-[11px] text-teal-700 font-semibold">
+                          Môi trường in đã được cô lập hoàn toàn chuẩn kích thước tem
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setIsPrePrintOverlayOpen(false)}
+                      className="p-1 text-slate-400 hover:text-slate-600 rounded-lg cursor-pointer"
+                    >
+                      <X className="h-5 w-5" />
+                    </button>
+                  </div>
+
+                  <div className="bg-teal-50/80 border border-teal-200 rounded-2xl p-4 space-y-2.5 text-xs text-slate-800">
+                    <div className="flex items-start gap-2.5">
+                      <span className="h-5 w-5 rounded-full bg-teal-600 text-white font-bold text-[11px] flex items-center justify-center shrink-0 mt-0.5">1</span>
+                      <div>
+                        <span className="font-bold text-slate-900">Khổ giấy (Paper Size): </span>
+                        Chọn đúng <strong className="text-teal-800 underline">{printConfig.labelRowType === '2-row' ? '102 × 20 mm (hoặc 100 × 20 mm)' : '50 × 20 mm (5 × 2 cm)'}</strong> trong mục <em>More settings</em> của máy in nhiệt.
+                      </div>
+                    </div>
+                    <div className="flex items-start gap-2.5">
+                      <span className="h-5 w-5 rounded-full bg-teal-600 text-white font-bold text-[11px] flex items-center justify-center shrink-0 mt-0.5">2</span>
+                      <div>
+                        <span className="font-bold text-slate-900">Lề trang (Margins): </span>
+                        Bắt buộc chọn <strong className="text-teal-800">None (Không có)</strong> hoặc <strong className="text-teal-800">Minimum</strong> (lề an toàn 1.5–2mm đã được căn sẵn trong tem).
+                      </div>
+                    </div>
+                    <div className="flex items-start gap-2.5">
+                      <span className="h-5 w-5 rounded-full bg-teal-600 text-white font-bold text-[11px] flex items-center justify-center shrink-0 mt-0.5">3</span>
+                      <div>
+                        <span className="font-bold text-slate-900">Tỷ lệ (Scale): </span>
+                        Giữ nguyên <strong className="text-rose-600">100% (Default / Actual Size)</strong> — <em>Tuyệt đối không chọn Fit to page / Fit to printable area</em>.
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-end gap-2 pt-2">
+                    <button
+                      type="button"
+                      onClick={() => setIsPrePrintOverlayOpen(false)}
+                      className="px-4 py-2 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl cursor-pointer transition-all"
+                    >
+                      Đóng thông báo
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleOpenPrintWindow}
+                      className="px-4 py-2 text-xs font-bold text-teal-800 bg-teal-100 hover:bg-teal-200 rounded-xl border border-teal-300 flex items-center gap-1.5 cursor-pointer transition-all"
+                    >
+                      <ArrowUpRight className="h-4 w-4" /> Mở Tab In Riêng
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handlePrintAction}
+                      className="px-5 py-2 text-xs font-bold text-white bg-teal-600 hover:bg-teal-700 rounded-xl shadow-md flex items-center gap-1.5 cursor-pointer transition-all"
+                    >
+                      <Printer className="h-4 w-4" /> Bấm để In ngay
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
 
           </div>
         </div>
       )}
 
-      {/* ================= TSC TL 240 / TE240 GUIDE MODAL ================= */}
-      {isTSCGuideOpen && (
-        <div className="fixed inset-0 bg-slate-900/70 backdrop-blur-xs flex items-center justify-center p-4 z-50">
-          <div className="bg-white rounded-3xl max-w-2xl w-full p-6 shadow-2xl border border-slate-200 flex flex-col max-h-[90vh] overflow-hidden animate-in fade-in zoom-in-95 duration-200">
-            {/* Modal Header */}
-            <div className="flex items-center justify-between border-b border-slate-100 pb-4 shrink-0">
-              <div className="flex items-center gap-3">
-                <div className="h-10 w-10 rounded-2xl bg-blue-100 border border-blue-200 flex items-center justify-center text-blue-700 text-lg font-bold">
-                  🖨️
-                </div>
-                <div>
-                  <h3 className="text-base font-bold text-slate-800">
-                    Hướng dẫn căn giữa Barcode cho máy in TSC TL 240 / TE240
-                  </h3>
-                  <p className="text-xs text-slate-500">
-                    Căn 2 thanh kẹp cuộn giấy, Calibrate cảm biến Gap và căn giữa trên BarTender Designer
-                  </p>
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={() => setIsTSCGuideOpen(false)}
-                className="h-8 w-8 rounded-full bg-slate-100 hover:bg-slate-200 flex items-center justify-center text-slate-500 transition-colors cursor-pointer"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-
-            {/* Modal Content - Scrollable */}
-            <div className="overflow-y-auto flex-1 py-4 space-y-4 pr-1 text-slate-700 text-xs">
-              
-              {/* Highlight summary */}
-              <div className="bg-blue-50 border-l-4 border-blue-600 p-3 rounded-r-xl">
-                <p className="font-bold text-blue-950">
-                  📌 Tại sao tem in ra máy TSC TL 240 bị lệch lề hoặc mã vạch không nằm ngay giữa?
-                </p>
-                <p className="text-blue-900 mt-1 leading-relaxed">
-                  Máy in <strong>TSC TL 240 / TE240</strong> sử dụng cơ chế kéo cuộn giấy định tâm (Center-aligned). 3 nguyên nhân chính khiến mã vạch không nằm ở giữa:
-                  <strong> (1)</strong> Hai thanh kẹp màu xanh giữ cuộn decal chưa được ép sát cuộn tem; 
-                  <strong> (2)</strong> Cảm biến Gap chưa được Calibrate khiến máy nhảy bước tem; 
-                  <strong> (3)</strong> Đối tượng Barcode trong BarTender Designer chưa được chọn "Center in Form".
-                </p>
-              </div>
-
-              {/* Step 1 */}
-              <div className="border border-slate-200 rounded-2xl p-3.5 bg-slate-50 space-y-2">
-                <div className="flex items-center gap-2">
-                  <span className="h-6 w-6 rounded-full bg-blue-600 text-white font-bold text-xs flex items-center justify-center shrink-0">1</span>
-                  <h4 className="font-bold text-slate-900 text-sm">
-                    Phần cứng: Căn chỉnh 2 thanh kẹp màu xanh ép sát cuộn giấy
-                  </h4>
-                </div>
-                <div className="pl-8 space-y-1.5 leading-relaxed text-slate-600">
-                  <p>Đây là <strong>bước quyết định vị trí vật lý</strong> của con tem:</p>
-                  <ul className="list-disc pl-4 space-y-1">
-                    <li>Mở nắp máy in TSC TL 240.</li>
-                    <li>Lắp cuộn tem 50x20mm vào trục giữa.</li>
-                    <li>Dùng tay <strong>gạt 2 thanh kẹp màu xanh lục (Green Media Guides)</strong> ép sát vào hai bên mép của cuộn decal (vừa khít, không bóp quá chặt để cuộn giấy xoay êm).</li>
-                    <li>Điều này đảm bảo khi máy kéo giấy ra, cuộn tem luôn chạy chính xác 100% tại tâm giữa của đầu in nhiệt, không bị trượt sang trái hoặc phải.</li>
-                  </ul>
-                </div>
-              </div>
-
-              {/* Step 2 */}
-              <div className="border border-slate-200 rounded-2xl p-3.5 bg-slate-50 space-y-2">
-                <div className="flex items-center gap-2">
-                  <span className="h-6 w-6 rounded-full bg-blue-600 text-white font-bold text-xs flex items-center justify-center shrink-0">2</span>
-                  <h4 className="font-bold text-slate-900 text-sm">
-                    Tự động Calibrate Cảm biến Gap trên máy TSC TL 240 (Chống nhảy tem)
-                  </h4>
-                </div>
-                <div className="pl-8 space-y-1.5 leading-relaxed text-slate-600">
-                  <p>Mỗi khi đổi sang máy mới hoặc cuộn tem mới, hãy thực hiện thao tác Calibrate cảm biến khe hở tem (Gap):</p>
-                  <ol className="list-decimal pl-4 space-y-1">
-                    <li><strong>Tắt công tắc nguồn</strong> phía sau máy in TSC TL 240.</li>
-                    <li>Nhấn giữ nút tròn <strong>FEED</strong> ở mặt trước máy, đồng thời <strong>bật công tắc nguồn</strong>.</li>
-                    <li>Đèn LED trên máy sẽ nháy theo chu kỳ: <em>Đỏ (5 lần) $\rightarrow$ Cam (5 lần) $\rightarrow$ Xanh (5 lần)</em>.</li>
-                    <li><strong>Nhả nút FEED ngay khi đèn nhấp nháy màu ĐỎ</strong> (chế độ Gap/Black Mark Sensor Calibration).</li>
-                    <li>Máy TSC TL 240 sẽ tự động đẩy ra 2-3 con tem để nhận diện chính xác khoảng cách khe hở giữa các con tem (2mm) và lưu vào bộ nhớ.</li>
-                  </ol>
-                </div>
-              </div>
-
-              {/* Step 3 */}
-              <div className="border border-slate-200 rounded-2xl p-3.5 bg-slate-50 space-y-2">
-                <div className="flex items-center gap-2">
-                  <span className="h-6 w-6 rounded-full bg-indigo-600 text-white font-bold text-xs flex items-center justify-center shrink-0">3</span>
-                  <h4 className="font-bold text-slate-900 text-sm">
-                    Căn giữa Barcode trong BarTender Designer (Nếu in qua BarTender)
-                  </h4>
-                </div>
-                <div className="pl-8 space-y-1.5 leading-relaxed text-slate-600">
-                  <p>Trong phần mềm BarTender Designer:</p>
-                  <ul className="list-disc pl-4 space-y-1">
-                    <li>Nhấp chuột chọn đối tượng mã vạch <strong>Barcode</strong>.</li>
-                    <li>Trên thanh menu trên cùng: Chọn <strong>Arrange (Sắp xếp) &gt; Align (Căn chỉnh) &gt; Center in Form (Căn giữa khổ tem)</strong>.</li>
-                    <li>Hoặc nhấp đúp vào Barcode $\rightarrow$ tại cây bên trái chọn <strong>Position (Vị trí)</strong> $\rightarrow$ mục <em>Object Alignment</em>: chuyển sang <strong>Center</strong>.</li>
-                    <li>Làm tương tự với dòng Tên hóa chất và Số lô. Khi đó dù mã dài hay ngắn, BarTender luôn tự động căn giữa cân đối tuyệt đối!</li>
-                  </ul>
-                </div>
-              </div>
-
-              {/* Step 4 */}
-              <div className="border border-slate-200 rounded-2xl p-3.5 bg-slate-50 space-y-2">
-                <div className="flex items-center gap-2">
-                  <span className="h-6 w-6 rounded-full bg-blue-600 text-white font-bold text-xs flex items-center justify-center shrink-0">4</span>
-                  <h4 className="font-bold text-slate-900 text-sm">
-                    Cấu hình Driver TSC TL 240 trong Windows
-                  </h4>
-                </div>
-                <div className="pl-8 space-y-1.5 leading-relaxed text-slate-600">
-                  <ul className="list-disc pl-4 space-y-1">
-                    <li>Vào <em>Windows Settings &gt; Bluetooth &amp; devices &gt; Printers &amp; scanners &gt; TSC TL 240 &gt; Printing Preferences</em>.</li>
-                    <li>Tab <strong>Page Setup</strong>: Chọn hoặc bấm <em>New...</em> tạo khổ tem: <strong>Width: 50.0mm</strong>, <strong>Height: 20.0mm</strong>, <strong>Gap: 2.0mm</strong>.</li>
-                    <li>Tab <strong>Graphics</strong>: Chọn <em>Dithering: None</em> (giúp mã vạch đen tuyền 100%, không bị chấm hạt).</li>
-                    <li>Tab <strong>Options</strong>: Darkness đặt <strong>10 - 12</strong>, Speed đặt <strong>2.0 in/s hoặc 3.0 in/s</strong>.</li>
-                  </ul>
-                </div>
-              </div>
-
-            </div>
-
-            {/* Modal Footer */}
-            <div className="pt-4 border-t border-slate-100 flex items-center justify-end gap-2 shrink-0">
-              <button
-                type="button"
-                onClick={() => setIsTSCGuideOpen(false)}
-                className="px-5 py-2 text-xs text-white bg-blue-600 hover:bg-blue-700 font-bold rounded-xl transition-all cursor-pointer shadow-sm"
-              >
-                Đã hiểu & Đóng
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-      {isBarTenderGuideOpen && (
-        <div className="fixed inset-0 bg-slate-900/70 backdrop-blur-xs flex items-center justify-center p-4 z-50">
-          <div className="bg-white rounded-3xl max-w-2xl w-full p-6 shadow-2xl border border-slate-200 flex flex-col max-h-[90vh] overflow-hidden animate-in fade-in zoom-in-95 duration-200">
-            {/* Modal Header */}
-            <div className="flex items-center justify-between border-b border-slate-100 pb-4 shrink-0">
-              <div className="flex items-center gap-3">
-                <div className="h-10 w-10 rounded-2xl bg-indigo-100 border border-indigo-200 flex items-center justify-center text-indigo-700 text-lg font-bold">
-                  🏷️
-                </div>
-                <div>
-                  <h3 className="text-base font-bold text-slate-800">
-                    Hướng dẫn in tem qua BarTender Enterprise / Designer
-                  </h3>
-                  <p className="text-xs text-slate-500">
-                    Kết nối file CSV hoặc Automation Script cho máy in Zebra ZD421 không bao giờ bị lệch chiều
-                  </p>
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={() => setIsBarTenderGuideOpen(false)}
-                className="h-8 w-8 rounded-full bg-slate-100 hover:bg-slate-200 flex items-center justify-center text-slate-500 transition-colors cursor-pointer"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-
-            {/* Modal Body */}
-            <div className="overflow-y-auto py-4 space-y-4 text-xs text-slate-700 pr-1 flex-1">
-              <div className="bg-indigo-50 border border-indigo-200 rounded-2xl p-3 flex items-start gap-2.5">
-                <span className="text-base mt-0.5">💡</span>
-                <div className="leading-relaxed text-indigo-900">
-                  <strong>Tại sao nên in qua BarTender?</strong><br />
-                  BarTender giao tiếp trực tiếp với Driver Seagull gốc của Zebra ZD421. Nó tự động khóa đúng chiều ngang của nhãn 50x20mm, mã vạch Code 128 được vẽ chuẩn 100% không bao giờ bị mờ nét hay in ngược chiều dọc như trình duyệt web!
-                </div>
-              </div>
-
-              {/* Cách 1: Kết nối CSV (Phổ biến & đơn giản nhất - 30 giây) */}
-              <div className="border border-indigo-100 rounded-2xl p-3.5 bg-slate-50 space-y-2.5">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <span className="h-6 w-6 rounded-full bg-indigo-600 text-white font-bold text-xs flex items-center justify-center shrink-0">A</span>
-                    <h4 className="font-bold text-indigo-950 text-sm">
-                      Cách 1: Mở mẫu tem BarTender &amp; Kết nối file .CSV (30 giây)
-                    </h4>
-                  </div>
-                  <span className="text-[10px] bg-indigo-100 text-indigo-700 font-bold px-2 py-0.5 rounded-full">
-                    Dễ nhất
-                  </span>
-                </div>
-                <div className="pl-8 space-y-2 leading-relaxed">
-                  <p><strong>Bước 1:</strong> Bấm nút <strong>"Xuất CSV"</strong> trên phần mềm để tải file dữ liệu về máy tính (ví dụ: <code>BarTender_Data_Atellica_...csv</code>).</p>
-                  <p><strong>Bước 2:</strong> Mở BarTender Designer, tạo khổ tem:
-                    <ul className="list-disc pl-4 mt-1 text-slate-600">
-                      <li>Width: <strong>50.0 mm</strong>, Height: <strong>20.0 mm</strong>.</li>
-                      <li>Orientation: <strong>Portrait</strong> (hoặc Landscape tùy chiều cuộn ra của máy in).</li>
-                    </ul>
-                  </p>
-                  <p><strong>Bước 3:</strong> Trên menu BarTender, chọn <strong>File &gt; Database Connection Setup</strong> (Thiết lập cơ sở dữ liệu) &gt; chọn <strong>Text File</strong> &gt; Browse đến file <code>.csv</code> vừa tải.</p>
-                  <p><strong>Bước 4:</strong> Kéo đối tượng <strong>Barcode (Code 128)</strong> vào tem &gt; chọn nguồn dữ liệu (Data Source) là trường <code>Barcode</code>. Kéo Text box liên kết trường <code>TenChatChuanQC</code>, <code>HanSuDung</code>, <code>SoThuTuTuyp</code>.</p>
-                  <p><strong>Bước 5:</strong> Bấm <strong>Ctrl + P</strong> trên BarTender &gt; Máy in Zebra ZD421 sẽ in toàn bộ lô tem ra nhanh chóng, rõ nét tuyệt đối!</p>
-                </div>
-              </div>
-
-              {/* Cách 2: Tự động hóa hoàn toàn với BarTender Enterprise Automation */}
-              <div className="border border-slate-200 rounded-2xl p-3.5 bg-slate-50 space-y-2.5">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <span className="h-6 w-6 rounded-full bg-slate-700 text-white font-bold text-xs flex items-center justify-center shrink-0">B</span>
-                    <h4 className="font-bold text-slate-900 text-sm">
-                      Cách 2: BarTender Enterprise Automation (.BTXML Script)
-                    </h4>
-                  </div>
-                  <span className="text-[10px] bg-slate-200 text-slate-700 font-bold px-2 py-0.5 rounded-full">
-                    Tự động
-                  </span>
-                </div>
-                <div className="pl-8 space-y-1.5 leading-relaxed text-slate-600">
-                  <p>Bấm nút <strong>"Xuất BTXML"</strong> để tải file kịch bản in XML.</p>
-                  <p>Nếu bệnh viện dùng <strong>BarTender Integration Builder</strong> hoặc <strong>BarTender Commander</strong>:</p>
-                  <ul className="list-disc pl-4 space-y-1">
-                    <li>Thả file <code>.btxml</code> vào thư mục Scan Folder (Hot Folder).</li>
-                    <li>BarTender Enterprise Automation sẽ tự động phát hiện và kích hoạt lệnh in ngay lập tức mà nhân viên không cần mở giao diện BarTender!</li>
-                  </ul>
-                </div>
-              </div>
-
-              {/* Cách 3: Nạp trực tiếp mã ZPL vào máy in */}
-              <div className="border border-slate-200 rounded-2xl p-3.5 bg-slate-50 space-y-2.5">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <span className="h-6 w-6 rounded-full bg-slate-700 text-white font-bold text-xs flex items-center justify-center shrink-0">C</span>
-                    <h4 className="font-bold text-slate-900 text-sm">
-                      Cách 3: Gửi mã Native ZPL trực tiếp sang Zebra ZD421
-                    </h4>
-                  </div>
-                  <span className="text-[10px] bg-slate-200 text-slate-700 font-bold px-2 py-0.5 rounded-full">
-                    Không cần phần mềm
-                  </span>
-                </div>
-                <div className="pl-8 space-y-1.5 leading-relaxed text-slate-600">
-                  <p>Bấm nút <strong>"Mã Zebra ZPL"</strong> để tải file <code>.zpl</code>.</p>
-                  <p>Mở công cụ <strong>Zebra Setup Utilities</strong> &gt; chọn Zebra ZD421 &gt; <em>Open Communication with Printer</em> &gt; Dán nội dung ZPL và bấm <em>Send To Printer</em>. Tem sẽ được in tức thì với tốc độ phần cứng cao nhất.</p>
-                </div>
-              </div>
-
-            </div>
-
-            {/* Modal Footer */}
-            <div className="pt-4 border-t border-slate-100 flex items-center justify-between gap-2 shrink-0">
-              <button
-                type="button"
-                onClick={handleExportBarTenderCSV}
-                className="px-4 py-2 text-xs text-indigo-700 bg-indigo-50 hover:bg-indigo-100 font-bold rounded-xl transition-all cursor-pointer border border-indigo-200 flex items-center gap-1.5"
-              >
-                <span>📊 Tải file CSV ngay</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setIsBarTenderGuideOpen(false)}
-                className="px-5 py-2 text-xs text-white bg-slate-800 hover:bg-slate-900 font-bold rounded-xl transition-all cursor-pointer shadow-sm"
-              >
-                Đã hiểu & Đóng
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ================= PRINT CONTAINER: HIDDEN ON SCREEN, VISIBLE ON PRINT ================= */}
-      {(selectedReconForPrint || selectedBarcodeCategory) && (
-        <div id="print-label-area" className="hidden">
-          {(() => {
-            const labelCount = printConfig.customCount || selectedReconForPrint?.remainingAliquots || selectedReconForPrint?.aliquotsCount || 1;
-            const labels = [];
-            for (let i = 1; i <= labelCount; i++) {
-              const tubeIndex = String(i).padStart(2, '0');
-              let barcodeValue = selectedBarcodeCategory?.code || 'QC';
-              if (printConfig.includeLot && selectedReconForPrint?.lotNumber) {
-                barcodeValue += `-${selectedReconForPrint.lotNumber}`;
-              }
-              if (printConfig.includeIndex) {
-                barcodeValue += `-${tubeIndex}`;
-              }
-              
-              labels.push({
-                index: tubeIndex,
-                barcodeValue,
-                displayName: selectedBarcodeCategory?.name || selectedReconForPrint?.targetItemName || '',
-                lot: selectedReconForPrint?.lotNumber || '',
-                expiry: selectedReconForPrint ? formatDateVN(selectedReconForPrint.expiryTimestamp) : '',
-                preparedBy: selectedReconForPrint?.preparedBy || '',
-              });
-            }
-
-            const labelRows = [];
-            const is50x20 = printConfig.labelSize === '50x20' || printConfig.labelSize === '50x20_double';
-            const itemsPerRow = printConfig.labelSize === '50x20' ? 1 : 2;
-            for (let i = 0; i < labels.length; i += itemsPerRow) {
-              if (itemsPerRow === 1) {
-                labelRows.push([labels[i]]);
-              } else {
-                labelRows.push([labels[i], labels[i + 1]]);
-              }
-            }
-
-            const isVertical = printConfig.barcodeOrientation === 'vertical' || printConfig.barcodeOrientation === 'vertical270';
-            const isRot180 = printConfig.barcodeOrientation === 'rotate180';
-            const rotDeg = printConfig.barcodeOrientation === 'vertical270' ? -90 : 90;
-
-            const renderAreaLabel = (item: typeof labels[0]) => {
-              if (isVertical) {
-                return (
-                  <div className="print-label print-label-vertical">
-                    <div className="bc-vert-col">
-                      <div className="bc-vert-wrapper" style={{ transform: `rotate(${rotDeg}deg)` }}>
-                        <BarcodeRenderer 
-                          value={item.barcodeValue} 
-                          heightMm={6.0}
-                          isVertical={true}
-                        />
-                        <div className="barcode-text-vert">{item.barcodeValue}</div>
+      {/* ================= PORTAL PRINT CONTAINER: DIRECT CHILD OF DOCUMENT.BODY ================= */}
+      {isPrintModalOpen && (selectedReconForPrint || selectedBarcodeCategory) && typeof document !== 'undefined' && createPortal(
+        <div id="thermal-print-portal" className="hidden">
+          {printConfig.labelRowType === '2-row'
+            ? getPairedLabelRows().map((pair, rowIdx) => (
+                <div key={rowIdx} className="label-item-2x10 label-row-2col">
+                  {pair.map((item, colIdx) =>
+                    item ? (
+                      <div key={colIdx} className="label-half-cell">
+                        <div className="label-header">
+                          <span className="header-hosp">{item.hospitalName ? item.hospitalName : ''}</span>
+                          {item.index ? <span className="index-badge">#{item.index}</span> : null}
+                        </div>
+                        <div className="item-name">{item.displayName}</div>
+                        <div className="barcode-section">
+                          <div
+                            className="w-full flex items-center justify-center"
+                            dangerouslySetInnerHTML={{
+                              __html: generatePureBarcodeSvg(item.barcodeValue, 7.0, 44),
+                            }}
+                          />
+                          <div className="barcode-text">{item.barcodeValue}</div>
+                        </div>
+                        <div className="label-footer">
+                          <span>LOT:{item.lot || '--'}</span>
+                          <span>HSD:{item.expiry || '--'}</span>
+                        </div>
                       </div>
-                    </div>
-                    <div className="info-vert-col">
-                      {printConfig.includeHospital && printConfig.hospitalName && (
-                        <div className="header-hosp-vert">{printConfig.hospitalName}</div>
-                      )}
-                      <div className="item-name-vert">{item.displayName}</div>
-                      <div className="details-vert">
-                        <div>LOT: {item.lot || '---'}</div>
-                        <div>HSD: {item.expiry}</div>
-                      </div>
-                      {item.index ? (
-                        <div className="index-badge-vert">Tuýp #{item.index}</div>
-                      ) : (
-                        <div style={{ fontSize: '6.5px', color: '#64748b', textAlign: 'right' }}>50x20mm</div>
-                      )}
-                    </div>
-                  </div>
-                );
-              }
-
-              return (
-                <div className={`print-label ${isRot180 ? 'rot-180' : ''}`}>
-                  {printConfig.includeHospital && printConfig.hospitalName && (
-                    <div className="header-hosp" style={{ fontSize: '6.5px', fontWeight: 700, textTransform: 'uppercase', lineHeight: 1, marginBottom: '0.5px' }}>
-                      {printConfig.hospitalName}
-                    </div>
+                    ) : (
+                      <div key={colIdx} className="label-half-cell" />
+                    )
                   )}
-                  <div className="item-name" style={{ fontSize: printConfig.includeHospital ? '8.5px' : '10px', fontWeight: 900, lineHeight: 1.15, letterSpacing: '-0.1px' }}>
-                    {item.displayName}
+                </div>
+              ))
+            : getPreparedLabels().map((item, idx) => (
+                <div key={idx} className="label-item-2x10">
+                  <div className="label-header">
+                    <span className="header-hosp">{item.hospitalName ? item.hospitalName : ''}</span>
+                    {item.index ? <span className="index-badge">#{item.index}</span> : null}
                   </div>
-                  <div className="barcode-container" style={{ margin: '0.2mm auto' }}>
-                    <BarcodeRenderer 
-                      value={item.barcodeValue} 
-                      heightMm={printConfig.includeHospital ? 7.0 : (printConfig.barcodeHeight || 8.0)}
-                      isVertical={false}
+                  <div className="item-name">{item.displayName}</div>
+                  <div className="barcode-section">
+                    <div
+                      className="w-full flex items-center justify-center"
+                      dangerouslySetInnerHTML={{
+                        __html: generatePureBarcodeSvg(item.barcodeValue, 7.0, 44),
+                      }}
                     />
+                    <div className="barcode-text">{item.barcodeValue}</div>
                   </div>
-                  <div className="barcode-text" style={{ fontSize: '8.5px', fontFamily: 'monospace', fontWeight: 900, textAlign: 'center', letterSpacing: '0.8px', lineHeight: 1, margin: '0.2mm 0' }}>
-                    {item.barcodeValue}
-                  </div>
-                  <div className="footer-text" style={{ fontSize: '7.2px', fontWeight: 800, borderTop: '0.8px solid #000', paddingTop: '1px', display: 'flex', justifyContent: 'space-between', width: '100%', lineHeight: 1 }}>
-                    <span>LOT: {item.lot || '---'}</span>
-                    <span>HSD: {item.expiry}</span>
-                    {item.index && <span>#{item.index}</span>}
+                  <div className="label-footer">
+                    <span>LOT:{item.lot || '---'}</span>
+                    <span>HSD:{item.expiry || '---'}</span>
                   </div>
                 </div>
-              );
-            };
-
-            return labelRows.map((row, rIndex) => (
-              <div key={rIndex} className="print-row">
-                {/* Label 1 */}
-                {row[0] && renderAreaLabel(row[0])}
-
-                {/* Label 2 */}
-                {itemsPerRow === 2 && row[1] && renderAreaLabel(row[1])}
-              </div>
-            ));
-          })()}
-        </div>
+              ))}
+        </div>,
+        document.body
       )}
 
       {/* ================= MODAL: EDIT RECONSTITUTION LOG ================= */}
@@ -3981,8 +3721,8 @@ PRINT 1,1`;
         </div>
       )}
 
-      {/* ================= PRINT LOG CONTAINER ================= */}
-      {isPrintLogModalOpen && (
+      {/* ================= PRINT LOG CONTAINER (PORTAL ON DOCUMENT.BODY) ================= */}
+      {isPrintLogModalOpen && typeof document !== 'undefined' && createPortal(
         <div id="print-log-area" className="hidden">
           <div className="print-log-container bg-white p-8">
             {/* Header with Logo */}
@@ -4069,65 +3809,16 @@ PRINT 1,1`;
               </div>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
 
       {/* Dynamic Embedded Print CSS style tag */}
       <style>{`
-        /* Screen styles for preview */
-        .label-preview-row {
-          display: flex;
-          gap: 8px;
-          background: #f1f5f9;
-          padding: 8px;
-          border-radius: 8px;
-          justify-content: center;
-        }
-        .label-preview-item {
-          width: 35mm;
-          height: 22mm;
-          background: white;
-          border: 1px solid #cbd5e1;
-          border-radius: 4px;
-          padding: 1.5mm 1mm 1mm 1mm;
-          box-sizing: border-box;
-          display: flex;
-          flex-direction: column;
-          justify-content: space-between;
-          font-family: 'Inter', sans-serif;
-          color: black;
-          box-shadow: 0 1px 2px rgba(0,0,0,0.05);
-          overflow: hidden;
-        }
-        .label-preview-item-50x20 {
-          width: 50mm;
-          height: 20mm;
-          background: white;
-          border: 1px solid #cbd5e1;
-          border-radius: 4px;
-          padding: 0.6mm 1.5mm 0.6mm 1.5mm;
-          box-sizing: border-box;
-          display: flex;
-          flex-direction: column;
-          justify-content: space-between;
-          align-items: center;
-          font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
-          color: black;
-          box-shadow: 0 1px 2px rgba(0,0,0,0.05);
-          overflow: hidden;
-        }
-        
         /* Print media styles */
         @media print {
-          /* Remove standard application layout from print flow */
-          #main-layout-root > aside,
-          #app-header-container,
-          #app-header,
-          #mobile-header,
-          #mobile-bottom-nav,
-          #app-marquee-footer,
-          #app-footer,
-          #tab-viewport-container {
+          /* Hide main React root and all non-print portals when printing */
+          body > *:not(#thermal-print-portal):not(#print-log-area) {
             display: none !important;
           }
 
@@ -4136,6 +3827,8 @@ PRINT 1,1`;
             padding: 0 !important;
             background: #ffffff !important;
             color: #000000 !important;
+            -webkit-print-color-adjust: exact !important;
+            print-color-adjust: exact !important;
           }
 
           #print-log-area {
@@ -4146,111 +3839,156 @@ PRINT 1,1`;
             padding: 0 !important;
           }
 
-          #print-label-area {
+          #thermal-print-portal {
             display: ${isPrintModalOpen ? 'block' : 'none'} !important;
-            width: ${printConfig.labelSize === '50x20' ? '50mm' : printConfig.labelSize === '50x20_double' ? '104mm' : '74mm'} !important;
-            margin: 0 auto !important;
+            width: ${printConfig.labelRowType === '2-row' ? '102mm' : '50mm'} !important;
+            margin: 0 !important;
             padding: 0 !important;
             background: white !important;
           }
 
-          .print-row {
-            display: flex !important;
-            flex-direction: row !important;
-            justify-content: center !important;
-            align-items: center !important;
-            width: ${printConfig.labelSize === '50x20' ? '50mm' : printConfig.labelSize === '50x20_double' ? '104mm' : '74mm'} !important;
-            height: ${(printConfig.labelSize === '50x20' || printConfig.labelSize === '50x20_double') ? '20mm' : '22mm'} !important;
-            max-height: ${(printConfig.labelSize === '50x20' || printConfig.labelSize === '50x20_double') ? '20mm' : '22mm'} !important;
+          .label-item-2x10 {
+            width: 50mm !important;
+            height: 20mm !important;
+            max-width: 50mm !important;
+            max-height: 20mm !important;
             box-sizing: border-box !important;
-            margin: 0 auto !important;
-            padding: 0 !important;
-            page-break-inside: avoid !important;
-            break-inside: avoid !important;
+            padding: 1.5mm 2mm !important;
+            border: none !important;
+            display: flex !important;
+            flex-direction: column !important;
+            justify-content: space-between !important;
+            overflow: hidden !important;
+            background: #ffffff !important;
+            color: #000000 !important;
             page-break-after: always !important;
             break-after: page !important;
+            page-break-inside: avoid !important;
+            break-inside: avoid !important;
+            font-family: Arial, Helvetica, sans-serif !important;
+          }
+
+          .label-item-2x10.label-row-2col {
+            width: 102mm !important;
+            max-width: 102mm !important;
+            padding: 0 !important;
+            display: grid !important;
+            grid-template-columns: 50mm 50mm !important;
+            column-gap: 2mm !important;
+            align-items: stretch !important;
+          }
+
+          .label-half-cell {
+            width: 50mm !important;
+            height: 20mm !important;
+            max-width: 50mm !important;
+            max-height: 20mm !important;
+            box-sizing: border-box !important;
+            padding: 1.5mm 2mm !important;
+            display: flex !important;
+            flex-direction: column !important;
+            justify-content: space-between !important;
             overflow: hidden !important;
           }
-          .print-row:last-child {
+
+          .label-item-2x10:last-child {
             page-break-after: auto !important;
             break-after: auto !important;
           }
 
-          .print-label {
-            width: ${(printConfig.labelSize === '50x20' || printConfig.labelSize === '50x20_double') ? '50mm' : '35mm'} !important;
-            height: ${(printConfig.labelSize === '50x20' || printConfig.labelSize === '50x20_double') ? '20mm' : '22mm'} !important;
-            max-height: ${(printConfig.labelSize === '50x20' || printConfig.labelSize === '50x20_double') ? '20mm' : '22mm'} !important;
-            box-sizing: border-box !important;
-            padding: ${(printConfig.labelSize === '50x20' || printConfig.labelSize === '50x20_double') ? '0.5mm 1.5mm 0.5mm 1.5mm' : '1.2mm 1mm 1mm 1mm'} !important;
-            margin: 0 !important;
-            margin-right: ${printConfig.labelSize === '50x20' ? '0' : '4mm'} !important; /* spacing between the 2 labels on roll */
+          .label-header {
             display: flex !important;
-            flex-direction: column !important;
             justify-content: space-between !important;
             align-items: center !important;
-            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif !important;
-            font-weight: 800 !important;
+            line-height: 1 !important;
+          }
+
+          .header-hosp {
+            font-size: 6.2px !important;
+            font-weight: 700 !important;
+            text-transform: uppercase !important;
+            white-space: nowrap !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+            max-width: 35mm !important;
             color: #000000 !important;
-            background: #ffffff !important;
-            border: none !important;
+          }
+
+          .index-badge {
+            font-size: 6.8px !important;
+            font-weight: 900 !important;
+            color: #000000 !important;
+            line-height: 1 !important;
+          }
+
+          .item-name {
+            font-size: 8px !important;
+            font-weight: 900 !important;
+            white-space: nowrap !important;
             overflow: hidden !important;
-            -webkit-print-color-adjust: exact !important;
-            print-color-adjust: exact !important;
+            text-overflow: ellipsis !important;
+            max-width: 46mm !important;
+            line-height: 1.05 !important;
+            color: #000000 !important;
           }
 
-          .print-label.print-label-vertical {
-            flex-direction: row !important;
-            justify-content: space-between !important;
-            align-items: stretch !important;
-            text-align: left !important;
-          }
-
-          .print-label.rot-180 {
-            transform: rotate(180deg) !important;
-          }
-
-          .bc-vert-col {
-            width: 18mm !important;
-            height: 18.2mm !important;
+          .barcode-section {
+            width: 100% !important;
             display: flex !important;
             flex-direction: column !important;
-            justify-content: center !important;
             align-items: center !important;
-            overflow: hidden !important;
-            flex-shrink: 0 !important;
-          }
-
-          .bc-vert-wrapper {
-            display: flex !important;
-            flex-direction: column !important;
             justify-content: center !important;
-            align-items: center !important;
-            width: 16mm !important;
-            height: 16mm !important;
-            transform-origin: center center !important;
+            margin: 0 !important;
           }
 
-          .info-vert-col {
-            flex: 1 !important;
-            height: 18.2mm !important;
+          .barcode-section svg {
+            display: block !important;
+            margin: 0 auto !important;
+            height: 7.0mm !important;
+            max-width: 44mm !important;
+            shape-rendering: crispEdges !important;
+            overflow: visible !important;
+          }
+
+          .barcode-section svg path,
+          .barcode-section svg rect {
+            fill: #000000 !important;
+            shape-rendering: crispEdges !important;
+          }
+
+          .barcode-text {
+            font-size: 6.8px !important;
+            font-family: 'Consolas', 'Courier New', monospace !important;
+            font-weight: 900 !important;
+            letter-spacing: 0.4px !important;
+            line-height: 1 !important;
+            margin-top: 0.2mm !important;
+            text-align: center !important;
+            color: #000000 !important;
+          }
+
+          .label-footer {
             display: flex !important;
-            flex-direction: column !important;
             justify-content: space-between !important;
-            padding-left: 1.5mm !important;
-            border-left: 0.8px dashed #000000 !important;
-            box-sizing: border-box !important;
-            overflow: hidden !important;
-            min-width: 0 !important;
+            align-items: center !important;
+            font-size: 6px !important;
+            font-weight: 700 !important;
+            border-top: 0.4px solid #000000 !important;
+            padding-top: 0.3mm !important;
+            line-height: 1 !important;
+            width: 100% !important;
+            color: #000000 !important;
           }
 
-          #print-label-area svg {
-            shape-rendering: auto;
+          #thermal-print-portal svg,
+          #thermal-print-portal svg * {
+            shape-rendering: crispEdges !important;
           }
 
-          /* Set page dimension to label size */
+          /* Cố định cứng khổ giấy: 50mm x 20mm (1-row) hoặc 102mm x 20mm (2-row) */
           @page {
-            size: ${isPrintLogModalOpen ? 'A4 portrait' : (printConfig.labelSize === '50x20' ? '50mm 20mm' : printConfig.labelSize === '50x20_double' ? '104mm 20mm' : '74mm 22mm')};
-            margin: ${isPrintLogModalOpen ? '10mm' : '0mm'};
+            size: ${isPrintLogModalOpen ? 'A4 portrait' : printConfig.labelRowType === '2-row' ? '102mm 20mm !important' : '50mm 20mm !important'};
+            margin: ${isPrintLogModalOpen ? '10mm' : '0mm !important'};
           }
         }
       `}</style>
@@ -4261,52 +3999,23 @@ PRINT 1,1`;
 
 function BarcodeRenderer({ 
   value, 
-  heightMm = 7.5,
-  isVertical = false,
-  width, 
-  height 
+  heightMm = 7.0,
+  maxWidthMm = 44,
 }: { 
   value: string; 
   heightMm?: number;
+  maxWidthMm?: number;
   isVertical?: boolean;
   width?: number; 
   height?: number; 
 }) {
-  const svgRef = useRef<SVGSVGElement>(null);
   const cleanVal = (value || 'QC').trim();
-  const numModules = cleanVal.length * 11 + 35;
-  const targetWidthMm = isVertical ? 15.5 : Math.max(30, Math.min(43, Math.round(numModules * 0.19 * 10) / 10));
-
-  useEffect(() => {
-    if (svgRef.current && cleanVal) {
-      try {
-        JsBarcode(svgRef.current, cleanVal, {
-          format: 'CODE128',
-          width: isVertical ? 1 : 2,
-          height: isVertical ? 25 : 40,
-          displayValue: false,
-          margin: 0,
-          background: 'transparent',
-          lineColor: '#000000',
-        });
-        if (svgRef.current) {
-          svgRef.current.setAttribute('preserveAspectRatio', 'none');
-          svgRef.current.style.display = 'block';
-          svgRef.current.style.marginLeft = 'auto';
-          svgRef.current.style.marginRight = 'auto';
-          svgRef.current.style.width = `${targetWidthMm}mm`;
-          svgRef.current.style.maxWidth = isVertical ? '16mm' : '44mm';
-          svgRef.current.style.height = `${heightMm}mm`;
-        }
-      } catch (err) {
-        console.error('Barcode error:', err);
-      }
-    }
-  }, [cleanVal, targetWidthMm, heightMm, isVertical]);
+  const svgHtml = generatePureBarcodeSvg(cleanVal, heightMm, maxWidthMm);
 
   return (
-    <div className="w-full flex items-center justify-center text-center">
-      <svg ref={svgRef} className="block mx-auto" />
-    </div>
+    <div
+      className="w-full flex items-center justify-center text-center"
+      dangerouslySetInnerHTML={{ __html: svgHtml }}
+    />
   );
 }
